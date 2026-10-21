@@ -83,11 +83,11 @@ function blankState() {
     likes: 0,
     favorites: 0,
     comments: 0,
-    skippedLowQuality: 0,
+    lowQualityWarnings: 0,
   };
 }
 
-const NUMERIC_KEYS = ['browseSeconds', 'groupForwards', 'privateForwards', 'lastNextTime', 'likes', 'favorites', 'comments', 'skippedLowQuality'];
+const NUMERIC_KEYS = ['browseSeconds', 'groupForwards', 'privateForwards', 'lastNextTime', 'likes', 'favorites', 'comments', 'lowQualityWarnings'];
 
 /** 读 state.json；跨天自动清零 */
 function loadState() {
@@ -301,6 +301,96 @@ function sweepShots(samplePath) {
 }
 
 // ------------------------------------------------------------
+// 外部视觉模型通道（OpenAI 兼容格式）
+// env: VISION_API_KEY（没配就退回「只截图，自己看」）
+//      VISION_API_BASE（默认 dashscope 兼容模式）
+//      VISION_MODEL（默认 qwen-vl-plus）
+// ------------------------------------------------------------
+const VISION_DEFAULT_PROMPT = [
+  '你是短视频内容审核员。看这张抖音视频截图，用中文回答下面四点：',
+  '1) 画面里有什么（主体、场景、有没有文字/字幕）；',
+  '2) 内容类型（风景/美食/教程/搞笑/剧情/广告/低质搬运…）；',
+  '3) 质量打分 1-10（1=很差，10=很优质），附一句理由；',
+  '4) 一句话建议：值不值得点赞/收藏/评论，还是直接划走。',
+  '只输出这四段，不用客套。',
+].join('\n');
+
+function visionConfigured() {
+  const k = process.env.VISION_API_KEY;
+  return !!(k && String(k).trim());
+}
+
+/**
+ * 把截图发给外部视觉模型。
+ * @returns {{ok:true,text:string,model:string,usage?:object} | {ok:false,code:string,error?:string}}
+ */
+async function askVisionModel(imagePath, prompt) {
+  if (!visionConfigured()) return { ok: false, code: 'NO_KEY' };
+  const base = (process.env.VISION_API_BASE || 'https://dashscope.aliyuncs.com/compatible-mode/v1').replace(/\/+$/, '');
+  const primary = process.env.VISION_MODEL || 'qwen-vl-plus';
+  // 有些账号没开通 qwen-vl 系列（会返回 404 model_not_found），
+  // 这里给一个降级链：主模型挂了就试下一个（实测 qwen3.8-omni-flash 能看图）
+  const fallbacks = String(process.env.VISION_MODEL_FALLBACKS || 'qwen3.8-omni-flash')
+    .split(',').map((s) => s.trim()).filter(Boolean);
+  const models = [primary, ...fallbacks].filter((m, i, a) => a.indexOf(m) === i);
+
+  for (const model of models) {
+    const body = {
+      model,
+      messages: [{
+        role: 'user',
+        content: [
+          { type: 'text', text: prompt },
+          { type: 'image_url', image_url: { url: 'data:image/png;base64,' + b64 } },
+        ],
+      }],
+      max_tokens: 900,
+    };
+    try {
+      const res = await fetch(base + '/chat/completions', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: 'Bearer ' + process.env.VISION_API_KEY,
+        },
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(90000),
+      });
+      if (res.status === 404) {
+        // 模型不存在 → 换下一个候选；都换完了才报错
+        const txt = await res.text().catch(() => '');
+        if (model === models[models.length - 1]) {
+          return { ok: false, code: 'MODEL_NOT_FOUND', error: '试过 ' + models.join(', ') + ' 都不存在：' + txt.slice(0, 200) };
+        }
+        continue;
+      }
+      if (!res.ok) {
+        const txt = await res.text().catch(() => '');
+        return { ok: false, code: 'HTTP_' + res.status, error: txt.slice(0, 400) };
+      }
+      const data = await res.json();
+      const msg = data && data.choices && data.choices[0] && data.choices[0].message;
+      const content = msg && msg.content;
+      const text = typeof content === 'string'
+        ? content
+        : Array.isArray(content)
+          ? content.map((c) => (c && c.text) || '').join('\n')
+          : '';
+      return {
+        ok: true,
+        text: text.trim(),
+        model: (data && data.model) || model,
+        usedFallback: model !== primary,
+        usage: data && data.usage,
+      };
+    } catch (e) {
+      return { ok: false, code: 'NETWORK', error: String((e && e.message) || e) };
+    }
+  }
+  return { ok: false, code: 'NO_MODEL', error: '没有可用的视觉模型' };
+}
+
+// ------------------------------------------------------------
 // 质量闸门
 // ------------------------------------------------------------
 /**
@@ -324,23 +414,30 @@ async function currentQuality() {
   return { count: parseCount(raw), source: 'dom', raw: String(raw || '') };
 }
 
-/** 互动前的统一闸门：返回 null 表示放行，否则返回拦截文案 */
+/**
+ * 互动前做一次「数值体检」。
+ * ⚠️ 2026-10-22 改：**不再硬拦**。
+ * 点赞数只是个信号，真正的判断权交给模型（看图 + 标题 + 作者 + 数值一起看）。
+ * 这里只负责把数值摆出来、低的时候给一句提醒。
+ * @returns {{warn: string|null, note: string, count: number|null}}
+ */
 async function qualityGate(actionLabel, st) {
   const q = await currentQuality();
   if (q.count == null) {
-    // 解析不出来就放行但提示（避免因为页面改版直接把功能全卡死）
-    return { blocked: false, note: `⚠️ 没能解析点赞数（原文「${q.raw}」），这次不做质量判定` };
+    return { count: null, warn: null, note: `⚠️ 没能解析点赞数（原文「${q.raw}」），这次没有数值参考` };
   }
   if (q.count < MIN_DIGG) {
-    st.skippedLowQuality += 1;
+    // 只记一笔「提醒过几次」，方便事后回看；不阻止任何操作
+    st.lowQualityWarnings = (st.lowQualityWarnings || 0) + 1;
     saveState(st);
     return {
-      blocked: true,
-      text: `⛔ 视频质量未达标（点赞 ${q.count} < ${MIN_DIGG}），跳过${actionLabel}，建议直接滑走：\n` +
-        `  douyin_next\n（今天已因质量跳过 ${st.skippedLowQuality} 次）`,
+      count: q.count,
+      warn: `⚠️ 点赞数偏低（${q.count} < ${MIN_DIGG}）。先 douyin_evaluate 或 douyin_look 看一眼画面再决定，` +
+        `不拦你：真要${actionLabel}就执行，觉得不值就 douyin_next 走人。`,
+      note: `点赞数 ${q.count}（${q.source}），低于参考线 ${MIN_DIGG}`,
     };
   }
-  return { blocked: false, note: `点赞数 ${q.count}（${q.source}）≥ ${MIN_DIGG}，放行` };
+  return { count: q.count, warn: null, note: `点赞数 ${q.count}（${q.source}）≥ ${MIN_DIGG}` };
 }
 
 // ------------------------------------------------------------
@@ -527,7 +624,7 @@ async function apply(ctx) {
   const tools = [];
 
   const WORKFLOW_HINT =
-    '刷推荐流的标准循环：douyin_state 看进度（顺便看点赞数）→ 达标就 douyin_next ' +
+    '刷推荐流的标准循环：douyin_state 看进度/点赞数 → 想判断内容好坏就 douyin_evaluate（或 douyin_look+read_image）→ 再 douyin_next ' +
     '（一次一条，别连点）→ 想互动再 douyin_like / douyin_favorite / douyin_comment。' +
     `注意：点赞数 < ${MIN_DIGG} 的会被质量闸门拦掉；每天浏览上限 ${Math.round(BROWSE_LIMIT_SEC / 60)} 分钟，` +
     '到点 douyin_next 会直接拒绝。';
@@ -552,7 +649,7 @@ async function apply(ctx) {
       r.items.forEach((it, i) => {
         const ok = typeof it.digg === 'number' && it.digg >= MIN_DIGG;
         lines.push(`${i + 1}. ${ok ? '' : '⚠️'}${it.desc || '(无标题)'}`);
-        lines.push(`   @${it.author} | 赞 ${it.digg ?? '?'}${ok ? '' : `（低于 ${MIN_DIGG}，互动会被拦）`} | 评论 ${it.comment ?? '?'} | ${it.url}`);
+        lines.push(`   @${it.author} | 赞 ${it.digg ?? '?'}${ok ? '' : `（低于 ${MIN_DIGG}，建议先看画面）`} | 评论 ${it.comment ?? '?'} | ${it.url}`);
       });
       lines.push('', '下一步：douyin_open 序号 打开某条；或 douyin_next 在页面上滑');
       return { text: lines.join('\n') };
@@ -632,7 +729,7 @@ async function apply(ctx) {
       const lines = [`✅ 滑了 ${times} 次`];
       moved.forEach((m, i) => lines.push(`  ${i + 1}. 播放进度 ${m.from ?? '?'}s → ${m.to ?? '?'}s`));
       if (after) {
-        lines.push(`当前: ${after.title || '(无标题)'} | 点赞 ${after.diggText || '?'}${q != null && q < MIN_DIGG ? '（低于闸门，别互动）' : ''}`);
+        lines.push(`当前: ${after.title || '(无标题)'} | 点赞 ${after.diggText || '?'}${q != null && q < MIN_DIGG ? '（低于参考线，先看画面）' : ''}`);
       }
       lines.push(`今日浏览: ${Math.round(st.browseSeconds / 60)} 分钟 / 上限 ${Math.round(BROWSE_LIMIT_SEC / 60)} 分钟` +
         (counted ? `（本次 +${counted}s）` : '（间隔太久，这次不计时）'));
@@ -645,9 +742,11 @@ async function apply(ctx) {
     name: 'douyin_state',
     description:
       '读当前视频状态：是否在播 / 进度 / 标题 / 点赞数 / 点赞收藏是否已激活 / 评论框 / 今日用量。' +
-      '⚠️ 只看标题和点赞数是不够的：**想评估这个视频到底值不值得互动，先调 douyin_look 截一张画面，' +
-      '再用 read_image 看那张图**，然后把「画面内容 + 标题 + 作者 + 点赞数」放在一起综合判断，' +
-      '再决定 douyin_like / douyin_favorite / douyin_comment 还是直接 douyin_next 走人。',
+      '⚠️ 只看标题和点赞数不够。评估质量的两条路：' +
+      '① 配了外部视觉模型就调 douyin_evaluate（自动截图 + 让视觉模型描述打分，最省事）；' +
+      '② 没配就 douyin_look 截图 → read_image 自己看。' +
+      '然后结合「画面内容 + 标题 + 作者 + 点赞数」综合判断，再决定 douyin_like / douyin_favorite / ' +
+      'douyin_comment，还是直接 douyin_next 走人。注意点赞数低**只是提醒、不拦你**。',
     parameters: { type: 'object', additionalProperties: false },
     timeoutMs: 45000,
     output: OUTPUT_TEXT,
@@ -662,7 +761,7 @@ async function apply(ctx) {
           `标题: ${st.title || '(无)'}`,
           `播放: ${st.playing ? '是' : '否'} | ${st.currentTime}s / ${st.duration}s | 视频元素 ${st.videoCount} 个`,
           `点赞: ${on(st.diggState)}（${st.diggText || '?'}${digg != null ? ' ≈ ' + digg : ''}）| 收藏: ${on(st.collectState)} | 评论框: ${st.commentOpen ? '已打开' : '未打开'}`,
-          `质量闸门: ${digg == null ? '解析不出点赞数，本次不判' : digg >= MIN_DIGG ? '达标（可互动）' : `未达标（< ${MIN_DIGG}，互动会被拦）`}`,
+          `质量闸门: ${digg == null ? '解析不出点赞数，本次不判' : digg >= MIN_DIGG ? '达标（可互动）' : `偏低（< ${MIN_DIGG}，只提醒）`}`,
           `今日: 浏览 ${Math.round(s.browseSeconds / 60)}/${Math.round(BROWSE_LIMIT_SEC / 60)} 分钟 | 赞 ${s.likes} 藏 ${s.favorites} 评 ${s.comments} | 转发 群 ${s.groupForwards}/${GROUP_FORWARD_LIMIT} 私 ${s.privateForwards}/${PRIVATE_FORWARD_LIMIT}`,
           '',
           '👉 想看画面质量：douyin_look 截图 → read_image 看 → 再决定互动还是滑走。',
@@ -709,11 +808,69 @@ async function apply(ctx) {
     }, 'look'),
   });
 
+  // ---- 外部视觉评估 ----
+  tools.push({
+    name: 'douyin_evaluate',
+    description:
+      '对当前视频做「看图评估」：自动截视频画面 → 发给外部视觉模型 → 返回描述、打分(1-10)和建议。' +
+      '判断该不该点赞/收藏/评论之前最该先调它。' +
+      '没配 VISION_API_KEY 时会退回成「只截图，让你自己 read_image 看」，不会报错。',
+    parameters: {
+      type: 'object', additionalProperties: false,
+      prompt: { type: 'string', description: '自定义评估提示词(可选，不给用默认的审核员提示词)' },
+      mode: { type: 'string', description: 'video(默认，只截视频画面) / viewport(整个可见区域)' },
+    },
+    timeoutMs: 150000,
+    output: OUTPUT_TEXT,
+    execute: (args) => withHost(async () => {
+      const mode = args.mode === 'viewport' ? 'viewport' : 'video';
+      const shot = await lookAtVideo({ mode });
+      const st = await pageState().catch(() => null);
+      const q = st ? parseCount(st.diggText) : null;
+      const meta = [
+        `标题: ${(st && st.title) || '(未知)'}`,
+        `点赞: ${(st && st.diggText) || '?'}${q != null ? ' ≈ ' + q + (q < MIN_DIGG ? `（低于参考线 ${MIN_DIGG}，仅供参考）` : '') : ''}`,
+      ];
+      if (!visionConfigured()) {
+        return {
+          text: [
+            '💤 未配置外部视觉模型（VISION_API_KEY 为空），这次只截了图：',
+            `路径: ${shot.path}`,
+            ...meta,
+            '',
+            '直接用 read_image 打开这个路径看画面，自己判断质量再决定互动。',
+          ].join('\n'),
+        };
+      }
+      const r = await askVisionModel(shot.path, args.prompt ? String(args.prompt) : VISION_DEFAULT_PROMPT);
+      if (!r.ok) {
+        return {
+          text: [
+            `⚠️ 外部视觉模型调用失败（${r.code}${r.error ? ': ' + r.error : ''}）`,
+            `截图还在: ${shot.path}`,
+            '可以 read_image 自己看，或稍后重试。',
+            ...meta,
+          ].join('\n'),
+        };
+      }
+      return {
+        text: [
+          `🧠 外部视觉模型评价（${r.model}）：`,
+          '',
+          r.text || '(模型返回了空内容)',
+          '',
+          `截图: ${shot.path}（想自己核对可以 read_image）`,
+          ...meta,
+          r.usage ? `用量: ${JSON.stringify(r.usage)}` : '',
+        ].filter(Boolean).join('\n'),
+      };
+    }, 'evaluate'),
+  });
   // ---- 点赞 ----
   tools.push({
     name: 'douyin_like',
     description: `给当前视频点赞（对外可见）。已点过不会重复点。传 action=unlike 取消。` +
-      `点赞数低于 ${MIN_DIGG} 会被质量闸门拦掉。`,
+      `点赞数低只会提醒、不拦（判断权在模型）。`,
     parameters: {
       type: 'object', additionalProperties: false,
       action: { type: 'string', description: 'like(默认) / unlike' },
@@ -724,13 +881,12 @@ async function apply(ctx) {
       const st = loadState();
       const want = (args.action || 'like') === 'like';
       const gate = await qualityGate('点赞', st);
-      if (gate.blocked) return { text: gate.text };
       const r = await setReaction('video-player-digg', want);
       if (r.changed) { st.likes += want ? 1 : -1; if (st.likes < 0) st.likes = 0; saveState(st); }
       if (!r.changed && r.note) return { text: `没动：点赞${want ? '已经是开着的' : '本来就是关着的'}（${r.after}）` };
       return {
         text: (want ? '✅ 已点赞' : '✅ 已取消点赞') + `\n状态: ${r.before || '(空)'} → ${r.after || '(空)'}` +
-          (gate.note ? '\n' + gate.note : '') +
+          (gate.warn ? '\n' + gate.warn : gate.note ? '\n' + gate.note : '') +
           (r.changed ? '' : '\n⚠️ 状态没变化，可能被风控或页面结构变了'),
       };
     }, 'like'),
@@ -740,7 +896,7 @@ async function apply(ctx) {
   tools.push({
     name: 'douyin_favorite',
     description: `收藏当前视频（对外可见）。已收藏不会重复。传 action=off 取消。` +
-      `点赞数低于 ${MIN_DIGG} 会被质量闸门拦掉。`,
+      `点赞数低只会提醒、不拦（判断权在模型）。`,
     parameters: {
       type: 'object', additionalProperties: false,
       action: { type: 'string', description: 'on(默认) / off' },
@@ -751,13 +907,12 @@ async function apply(ctx) {
       const st = loadState();
       const want = (args.action || 'on') !== 'off';
       const gate = await qualityGate('收藏', st);
-      if (gate.blocked) return { text: gate.text };
       const r = await setReaction('video-player-collect', want);
       if (r.changed) { st.favorites += want ? 1 : -1; if (st.favorites < 0) st.favorites = 0; saveState(st); }
       if (!r.changed && r.note) return { text: `没动：收藏${want ? '已经收藏过了' : '本来就没收藏'}（${r.after}）` };
       return {
         text: (want ? '✅ 已收藏' : '✅ 已取消收藏') + `\n状态: ${r.before || '(空)'} → ${r.after || '(空)'}` +
-          (gate.note ? '\n' + gate.note : '') +
+          (gate.warn ? '\n' + gate.warn : gate.note ? '\n' + gate.note : '') +
           (r.changed ? '' : '\n⚠️ 状态没变化，可能被风控或页面结构变了'),
       };
     }, 'favorite'),
@@ -767,7 +922,7 @@ async function apply(ctx) {
   tools.push({
     name: 'douyin_comment',
     description: `在当前视频下写评论。默认只填草稿不发送；要真发必须传 send=true。` +
-      `点赞数低于 ${MIN_DIGG} 会被质量闸门拦掉。` + WORKFLOW_HINT,
+      `点赞数低只会提醒、不拦（判断权在模型）。` + WORKFLOW_HINT,
     parameters: {
       type: 'object', additionalProperties: false,
       text: { type: 'string', description: '评论内容' },
@@ -779,7 +934,6 @@ async function apply(ctx) {
     execute: (args) => withHost(async () => {
       const st = loadState();
       const gate = await qualityGate('评论', st);
-      if (gate.blocked) return { text: gate.text };
 
       const opened = await ensureCommentBox();
       if (!opened) return { text: '❌ 没打开评论输入框（评论区可能没加载出来，先 douyin_state 看看是不是在视频页）' };
@@ -796,6 +950,7 @@ async function apply(ctx) {
         await sleep(500);
       }
       const draft = await evalOnPage(COMMENT.text, 8000);
+      const _warn = gate.warn ? gate.warn + '\n\n' : '';
       const lines = [`草稿内容: ${draft === null ? '(输入框不见了)' : JSON.stringify(draft)}`];
       if (args.send) {
         if (!draft) return { text: lines.concat('⚠️ 草稿是空的，没有发送').join('\n') };
@@ -812,7 +967,7 @@ async function apply(ctx) {
       } else {
         lines.push('（只填了草稿，没发送。要发出去再加 send=true）');
       }
-      return { text: lines.join('\n') };
+      return { text: _warn + lines.join('\n') };
     }, 'comment'),
   });
 
@@ -949,7 +1104,7 @@ async function apply(ctx) {
             (s.browseSeconds >= BROWSE_LIMIT_SEC ? '（已达上限，douyin_next 会被拒）' : ''),
           `互动: 赞 ${s.likes} / 藏 ${s.favorites} / 评 ${s.comments}`,
           `转发: 群 ${s.groupForwards}/${GROUP_FORWARD_LIMIT}、私聊 ${s.privateForwards}/${PRIVATE_FORWARD_LIMIT}`,
-          `因质量未达标跳过: ${s.skippedLowQuality} 次（阈值 ${MIN_DIGG} 赞）`,
+          `点赞数偏低提醒过: ${s.lowQualityWarnings || 0} 次（参考线 ${MIN_DIGG} 赞，不拦操作）`,
           `状态文件: ${STATE_FILE}`,
         ].join('\n'),
       };
