@@ -1,0 +1,19 @@
+# 运行时数据（profile 里是登录态，几百 MB 到 1GB，绝不能进包/仓库）
+data/
+profile/
+shots/
+*.log
+*.tgz
+
+# 依赖
+node_modules/
+
+# 老布局的临时产物
+host-console.log
+host-test.log
+plugin-autostart.log
+*.orig-*
+_export_*/
+hsts3*/
+e2e-test.mjs
+package-lock.json

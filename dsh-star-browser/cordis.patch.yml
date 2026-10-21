@@ -1,0 +1,9 @@
+# dsh-star-browser bundle layer: 注册繁星独立浏览器工具集。
+# 管家 (host.mjs) 跑在用户桌面会话 (schtasks dsh-star-browser-host),
+# 本插件只做 HTTP 客户端, 不发布任何服务 → 可松散挂载。
+- insert:
+    - id: star-browser
+      name: dsh-star-browser
+      config:
+        host: http://127.0.0.1:9443
+        toolTimeoutMs: 90000

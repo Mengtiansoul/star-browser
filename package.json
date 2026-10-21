@@ -1,0 +1,53 @@
+{
+  "name": "dsh-star-browser",
+  "version": "0.3.0",
+  "description": "独立 Edge 管家 + DSH 插件：多 session 隔离的浏览器基座，抖音/网页抓取等业务作为租户按 sessionId 路由，不抢页、不泄漏、抗编号漂移。",
+  "type": "module",
+  "main": "index.mjs",
+  "exports": {
+    ".": "./index.mjs",
+    "./host": "./host.mjs",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "bin": {
+    "star-browser": "./bin/cli.mjs",
+    "star-browser-launch": "./bin/launch-session1.mjs"
+  },
+  "files": [
+    "index.mjs",
+    "host.mjs",
+    "cordis.patch.yml",
+    "bin/",
+    "lib/",
+    "scripts/",
+    "README.md"
+  ],
+  "scripts": {
+    "start": "node bin/cli.mjs",
+    "start:headless": "node bin/cli.mjs --headless",
+    "detach": "node bin/cli.mjs --detach",
+    "doctor": "node bin/cli.mjs --doctor",
+    "postinstall": "node scripts/postinstall.mjs"
+  },
+  "dependencies": {
+    "playwright-core": "^1.63.0"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "playwright",
+    "browser-automation",
+    "edge",
+    "cdp"
+  ],
+  "license": "MIT"
+}
