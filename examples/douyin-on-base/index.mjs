@@ -56,6 +56,8 @@ const GROUP_FORWARD_LIMIT = Number(process.env.DOUYIN_GROUP_FORWARD_LIMIT || 5);
 const PRIVATE_FORWARD_LIMIT = Number(process.env.DOUYIN_PRIVATE_FORWARD_LIMIT || 3);
 /** 质量闸门：点赞数低于这个值不许互动 */
 const MIN_DIGG = Number(process.env.DOUYIN_MIN_DIGG || 5000);
+/** 每日自动回复上限（防封号） */
+const DAILY_REPLY_LIMIT = Number(process.env.DOUYIN_REPLY_LIMIT || 20);
 
 const OUTPUT_TEXT = {
   schema: { type: 'object', additionalProperties: false, properties: { text: { type: 'string' } }, required: ['text'] },
@@ -84,10 +86,11 @@ function blankState() {
     favorites: 0,
     comments: 0,
     lowQualityWarnings: 0,
+    replies: 0,
   };
 }
 
-const NUMERIC_KEYS = ['browseSeconds', 'groupForwards', 'privateForwards', 'lastNextTime', 'likes', 'favorites', 'comments', 'lowQualityWarnings'];
+const NUMERIC_KEYS = ['browseSeconds', 'groupForwards', 'privateForwards', 'lastNextTime', 'likes', 'favorites', 'comments', 'lowQualityWarnings', 'replies'];
 
 /** 读 state.json；跨天自动清零 */
 function loadState() {
@@ -541,6 +544,104 @@ async function ensureCommentBox() {
   return !!(await evalOnPage(COMMENT.check, 8000));
 }
 
+// ------------------------------------------------------------
+// 私信 / 群聊（实测结论见文件头）
+// ⚠️ 关键：消息面板**必须用真实鼠标点击**打开 —— 派发合成 click 只会让
+//    React 把面板组件挂上去（DOM 里有 conversation-item），但面板不显示、
+//    尺寸为 0。所以这里统一走 rpc click（Playwright 真点击）。
+// ------------------------------------------------------------
+const IM_PANEL_VISIBLE_EXPR = `(() => {
+  const d = document.querySelector('[data-e2e="im-dialog"]');
+  if (!d) return false;
+  const r = d.getBoundingClientRect();
+  return r.width > 100 && r.height > 100;
+})()`;
+
+const IM_EDITOR_SEL = '[data-e2e="msg-input"] [contenteditable="true"]';
+
+const IM_LIST_EXPR = `(() => {
+  const convs = [...document.querySelectorAll('[data-e2e="conversation-item"]')];
+  const panel = document.querySelector('[data-e2e="im-dialog"]');
+  const pr = panel ? panel.getBoundingClientRect() : null;
+  return JSON.stringify(convs.map((c) => {
+    const r = c.getBoundingClientRect();
+    const raw = (c.innerText || '').trim().replace(/\\s+/g, ' ');
+    const badge = c.querySelector('.semi-badge, [class*="badge"]');
+    const badgeText = badge ? (badge.innerText || '').trim() : '';
+    // 会话列表的 innerText 是「名字 时间 预览 未读数」拼在一起的，没有独立字段，
+    // 只能这么拆：第一段当名字，未读数单独取
+    const name = raw.split(' ')[0] || raw;
+    return {
+      name,
+      raw: raw.slice(0, 80),
+      unread: /^\\d+$/.test(badgeText) ? Number(badgeText) : 0,
+      visible: r.width > 50,
+      rect: [Math.round(r.x), Math.round(r.y)],
+      isLeftColumn: pr ? r.x < pr.x + pr.width / 2 : null,
+    };
+  }));
+})()`;
+
+const IM_MESSAGES_EXPR = `(() => {
+  const panel = document.querySelector('[data-e2e="im-dialog"]');
+  const pr = panel ? panel.getBoundingClientRect() : null;
+  const items = [...document.querySelectorAll('[data-e2e="msg-item-content"]')];
+  const rows = items.map((it) => {
+    const box = it.closest('[class*="MessageBox"]') || it.parentElement;
+    const br = box ? box.getBoundingClientRect() : null;
+    const text = (it.innerText || '').trim().replace(/\\s+/g, ' ');
+    const imgs = it.querySelectorAll('img').length;
+    const nameEl = box ? box.querySelector('[class*="avatarName"]') : null;
+    return {
+      text,
+      imgs,
+      sender: nameEl ? (nameEl.innerText || '').trim() : null,
+      // 自己发的在右侧；私聊不显示昵称，只能靠左右判断
+      mine: pr && br ? br.x > pr.x + pr.width / 2 : null,
+      kind: text ? 'text' : (imgs ? 'image' : 'other'),
+    };
+  });
+  return JSON.stringify({ count: rows.length, items: rows.slice(-10) });
+})()`;
+
+const IM_EDITOR_TEXT_EXPR = `(() => {
+  const ed = document.querySelector('[data-e2e="msg-input"] [contenteditable="true"]');
+  return ed ? (ed.innerText || '').replace(/\\u200b/g, '').trim() : null;
+})()`;
+
+/** 打开消息面板（真实点击；合成事件不显示） */
+async function ensureImPanel() {
+  if (await evalOnPage(IM_PANEL_VISIBLE_EXPR, 8000)) return true;
+  const r = await rpc('click', { selector: '[data-e2e="im-entry"]' });
+  if (!r.ok) throw new Error('点不开消息入口: ' + (r.error || ''));
+  await sleep(2200);
+  return !!(await evalOnPage(IM_PANEL_VISIBLE_EXPR, 8000));
+}
+
+/** 按名字模糊匹配会话并真实点开它（先打标记，再用 Playwright 点击） */
+async function openChatByName(name) {
+  if (!(await ensureImPanel())) throw new Error('消息面板没打开（可能被弹窗挡住，或用合成事件点不开）');
+  const mark = await evalOnPage(`(() => {
+    const want = ${JSON.stringify(String(name))};
+    document.querySelectorAll('[data-dy-target]').forEach((e) => e.removeAttribute('data-dy-target'));
+    const convs = [...document.querySelectorAll('[data-e2e="conversation-item"]')];
+    const hit = convs.find((c) => (c.innerText || '').includes(want));
+    if (!hit) {
+      return { ok: false, error: '没找到会话: ' + want, available: convs.map((c) => ((c.innerText || '').trim().split('\\n')[0] || '').slice(0, 20)) };
+    }
+    hit.setAttribute('data-dy-target', '1');
+    return { ok: true };
+  })()`, 8000);
+  if (!mark || !mark.ok) {
+    const err = new Error((mark && mark.error) || '标记会话失败');
+    err.available = mark && mark.available;
+    throw err;
+  }
+  const click = await rpc('click', { selector: '[data-dy-target="1"]' });
+  if (!click.ok) throw new Error('点开会话失败: ' + (click.error || ''));
+  await sleep(1800);
+  return true;
+}
 // ------------------------------------------------------------
 // 分享 / 转发
 // ------------------------------------------------------------
@@ -1088,6 +1189,127 @@ async function apply(ctx) {
     }, 'api_log'),
   });
 
+  // ---- 私信/群聊：列表 ----
+  tools.push({
+    name: 'douyin_list_chats',
+    description:
+      '打开抖音消息面板，列出会话（私聊/群聊），带未读数。' +
+      '注意：会话**没有稳定 ID**，只能用名字（第一段文字）当键；未读数来自页面的 semi-badge。',
+    parameters: { type: 'object', additionalProperties: false },
+    timeoutMs: 60000,
+    output: OUTPUT_TEXT,
+    execute: () => withHost(async () => {
+      if (!(await ensureImPanel())) return { text: '❌ 消息面板没打开（抖音可能改了入口，或者需要真实点击）' };
+      const raw = await evalOnPage(IM_LIST_EXPR, 10000);
+      let list = [];
+      try { list = JSON.parse(raw); } catch {}
+      if (!list.length) return { text: '面板开了但没读到会话（可能还在加载）' };
+      const lines = [`共 ${list.length} 个会话（未读合计 ${list.reduce((a, c) => a + (c.unread || 0), 0)}）`, ''];
+      for (const c of list) {
+        lines.push(`${c.unread ? '🔴' + c.unread : '  '} ${c.raw}`);
+      }
+      lines.push('', '下一步：douyin_read_chat target=<上面的名字> 读消息；douyin_send_chat 发消息');
+      return { text: lines.join('\n') };
+    }, 'list_chats'),
+  });
+
+  // ---- 私信/群聊：读消息 ----
+  tools.push({
+    name: 'douyin_read_chat',
+    description:
+      '点开指定会话（按名字模糊匹配），读最近 10 条消息。' +
+      '文本消息给正文；图片/表情包只标 [图片]。' +
+      '⚠️ 抖音的消息列表是窗口化渲染（滚出可视区的会被卸载），所以只能拿到"当前渲染出来的"那几条，' +
+      '看不到历史更早的记录；切走期间的新消息如果已经滚出窗口也补不回来。',
+    parameters: {
+      type: 'object', additionalProperties: false,
+      target: { type: 'string', description: '会话名字（/群名，模糊匹配就行）' },
+    },
+    timeoutMs: 90000,
+    output: OUTPUT_TEXT,
+    execute: (args) => withHost(async () => {
+      if (!args.target) throw new Error('需要 target（会话名）');
+      try {
+        await openChatByName(args.target);
+      } catch (e) {
+        const avail = e && e.available ? '\n现有会话: ' + e.available.join(' / ') : '';
+        throw new Error(((e && e.message) || String(e)) + avail);
+      }
+      const raw = await evalOnPage(IM_MESSAGES_EXPR, 12000);
+      let data = { count: 0, items: [] };
+      try { data = JSON.parse(raw); } catch {}
+      const lines = [`会话「${args.target}」当前渲染出 ${data.count} 条消息：`, ''];
+      for (const m of data.items) {
+        const who = m.mine === true ? '我' : m.mine === false ? '对方' : '?';
+        const body = m.kind === 'image' ? '[图片/表情]' : m.kind === 'text' ? m.text : '[非文本]';
+        const name = m.sender ? `（${m.sender}）` : '';
+        lines.push(`${who}${name}: ${body}`);
+      }
+      if (!data.count) lines.push('(没读到消息：可能是新会话，或页面还没加载完)');
+      lines.push('', '发消息：douyin_send_chat target="' + args.target + '" text="..."（默认只填草稿）');
+      return { text: lines.join('\n') };
+    }, 'read_chat'),
+  });
+
+  // ---- 私信/群聊：发消息 ----
+  tools.push({
+    name: 'douyin_send_chat',
+    description:
+      `给指定会话发文本消息。**默认只填草稿不发送**，要真发传 send=true。` +
+      `发出去就是真的发给真人了（对外可见，撤不回来），确认过再发。` +
+      `每日自动回复上限 ${DAILY_REPLY_LIMIT} 条（防封号），用完就拒。`,
+    parameters: {
+      type: 'object', additionalProperties: false,
+      target: { type: 'string', description: '会话名（模糊匹配）' },
+      text: { type: 'string', description: '要发的内容（纯文本）' },
+      send: { type: 'boolean', description: 'true=真的发出去；默认 false 只填草稿' },
+      clear: { type: 'boolean', description: 'true=发送前先清空输入框（默认覆盖）' },
+    },
+    timeoutMs: 120000,
+    output: OUTPUT_TEXT,
+    execute: (args) => withHost(async () => {
+      if (!args.target) throw new Error('需要 target（会话名）');
+      if (!args.text) throw new Error('需要 text');
+      const st = loadState();
+      const doSend = !!args.send;
+      if (doSend && st.replies >= DAILY_REPLY_LIMIT) {
+        return { text: `⛔ 今日自动回复已达上限（${st.replies}/${DAILY_REPLY_LIMIT} 条），今天的私信不再自动发。明天 0 点重置。` };
+      }
+      await openChatByName(args.target);
+      if (args.clear) {
+        await evalOnPage(`(() => { const ed = document.querySelector('${IM_EDITOR_SEL}'); if (ed) { ed.focus(); return true; } return false; })()`, 8000);
+        await rpc('press', { key: 'Control+a' });
+        await rpc('press', { key: 'Delete' });
+        await sleep(300);
+      }
+      const typed = await rpc('type', { selector: IM_EDITOR_SEL, text: String(args.text), replace: !args.clear });
+      if (!typed.ok) throw new Error(typed.error || '输入失败');
+      await sleep(600);
+      const draft = await evalOnPage(IM_EDITOR_TEXT_EXPR, 8000);
+      const lines = [`草稿: ${draft === null ? '(没找到输入框)' : JSON.stringify(draft)}`];
+      if (!doSend) {
+        lines.push('（只填了草稿，没发送。确认要发再加 send=true）');
+        return { text: lines.join('\n') };
+      }
+      if (!draft) {
+        lines.push('⚠️ 草稿是空的，没有发送');
+        return { text: lines.join('\n') };
+      }
+      await rpc('press', { key: 'Enter' });
+      await sleep(1500);
+      const after = await evalOnPage(IM_EDITOR_TEXT_EXPR, 8000);
+      const sent = !after;
+      if (sent) {
+        st.replies += 1;
+        saveState(st);
+        lines.push(`✅ 已发送（回车提交，输入框已清空）`);
+        lines.push(`今日自动回复: ${st.replies}/${DAILY_REPLY_LIMIT}`);
+      } else {
+        lines.push('⚠️ 按了回车但输入框还有内容，可能没发出去（抖音可能要求点发送按钮，或有风控）');
+      }
+      return { text: lines.join('\n') };
+    }, 'send_chat'),
+  });
   // ---- 今日用量 ----
   tools.push({
     name: 'douyin_usage',
