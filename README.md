@@ -231,6 +231,37 @@ POST /rpc { op:'get_network_log', sessionId:'douyin-worker-1',
 - **macOS / Linux**：直接前台起（`star-browser --headless` 适合服务器）。
   登录自启用 launchd / systemd --user。
 
+## 十一、FAQ
+
+**Q：全局装之后抖音/B站要重新登录？**
+
+会。`npm i -g <tgz>` 把包装到全局目录，`<包>/data/profile` 是全新的空 profile，
+原来的登录态还在旧的 `<包>/profile` 里。三种解法（选一个）：
+
+```bash
+# ① 环境变量指回原来的数据目录（最干净）
+setx STAR_BROWSER_DATA "D:\path\to\old\data"
+
+# ② 给全局包建个目录联接（Windows，立即生效）
+mklink /J "%APPDATA%\npm\node_modules\dsh-star-browser\data" "D:\path\to\old\data"
+
+# ③ 别用 tgz 装，改用 npm link 指向源码目录（profile 就是源码那份）
+cd <源码目录> && npm link
+```
+
+**Q：`star-browser` 命令找不到？**
+
+`%APPDATA%\npm` 不在 PATH 里。跑一次
+`setx PATH "%PATH%;%APPDATA%\npm"` 然后重开终端。
+
+**Q：`--install-task` 报权限错误？**
+
+注册登录自启要管理员权限。用「以管理员身份运行」的终端再跑一次。
+
+**Q：`--detach` 说探测不到交互用户？**
+
+服务身份下读不到登录用户。设 `STAR_BROWSER_SESSION_USER=<你的用户名>`。
+
 ## License
 
 MIT
