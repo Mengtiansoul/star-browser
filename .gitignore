@@ -19,3 +19,5 @@ e2e-test.mjs
 package-lock.json
 
 examples/*/state.json
+
+star-browser-*.txt
