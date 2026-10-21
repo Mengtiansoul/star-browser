@@ -21,3 +21,9 @@ package-lock.json
 examples/*/state.json
 
 star-browser-*.txt
+
+# 历史遗留启动脚本（本地保留，不再入库）
+launch.ps1
+start-host.ps1
+start-host-hidden.vbs
+start-launch-hidden.vbs

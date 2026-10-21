@@ -3,7 +3,7 @@
 // 模型可见工具: star_browser_status / star_navigate / star_snapshot /
 //   star_click / star_type / star_press / star_scroll / star_text /
 //   star_wait / star_screenshot / star_pages
-// 所有工具都是 127.0.0.1:9443 管家 (D:\Deepseek-Harness\Fan_xing\browser\host.mjs) 的
+// 所有工具都是 127.0.0.1:9443 管家 (<包目录>\host.mjs) 的
 // 纯文本 HTTP 客户端。管家跑在用户桌面会话, 驱动独立 Edge。
 // ============================================================
 

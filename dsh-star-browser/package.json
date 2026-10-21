@@ -1,6 +1,6 @@
 {
   "name": "dsh-star-browser",
-  "description": "繁星独立浏览器工具集: model-facing star_* 工具, 驱动 D:\\Deepseek-Harness\\Fan_xing\\browser 管家里的独立 Edge(独立 profile, 与用户浏览器完全隔离)。",
+  "description": "繁星独立浏览器工具集: model-facing star_* 工具, 驱动 <包目录> 管家里的独立 Edge(独立 profile, 与用户浏览器完全隔离)。",
   "version": "0.1.0",
   "private": true,
   "type": "module",

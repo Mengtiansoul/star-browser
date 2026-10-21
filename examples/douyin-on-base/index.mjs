@@ -5,7 +5,7 @@
 //   · 专属 sessionId、接口 JSON（不走 DOM）、eval 注入滑动/点击
 //   · 每日状态存储 + 防沉迷计时 + 转发配额 + 质量闸门
 //
-// 安装：dsh plugin add link:D:/Deepseek-Harness/Fan_xing/browser/examples/douyin-on-base
+// 安装：dsh plugin add link:<包目录>/examples/douyin-on-base
 // 依赖：star-browser 管家在线（star-browser --detach）
 //
 // ════════════════════════════════════════════════════════════
@@ -25,7 +25,7 @@
 // 6) 点赞数在 DOM：`[data-e2e="video-player-digg"]` 的 innerText，
 //    实测值是 "7.9万" 这种短单位格式 → 必须写单位解析。
 // 7) 分享面板（点 video-player-share）里实测能看到：
-//    「分享给朋友」分组 + 群条目（如「八方来财 65 分享」）+ 好友条目 +
+//    「分享给朋友」分组 + 群条目（如「某某群 65 分享」）+ 好友条目 +
 //    「复制链接」按钮。**但入口存在 ≠ 送达可靠**：旧插件实测点完后群里
 //    收不到、回执永远是「未确认」。所以 douyin_share 默认 dryRun，
 //   真发送要显式 send:true，且结果标 uncertain（不谎报送达）。
@@ -556,7 +556,7 @@ const listShareTargets = `(() => {
     })
     .map((e) => {
       const raw = (e.innerText || '').trim().replace(/\\s+/g, ' ');
-      // 抖音的条目文字会带后缀：「八方来财 65 分享」「某某24分钟前在线分享」「复制链接抖音 app 扫码观看」
+      // 抖音的条目文字会带后缀：「某某群 65 分享」「某某24分钟前在线分享」「复制链接抖音 app 扫码观看」
       // 给一个可当 target 用的干净名字，raw 保留原样
       const name = raw
         .replace(/\\s*抖音\\s*app\\s*扫码观看$/i, '')
@@ -572,8 +572,8 @@ const listShareTargets = `(() => {
 
 /**
  * 点某个分享目标。
- * 用**包含匹配**而不是全等：面板里的文字是「八方来财 65 分享」这种，
- * target 传「八方来财」也命中。命中多个时取文本最短、层级最浅的那个
+ * 用**包含匹配**而不是全等：面板里的文字是「某某群 65 分享」这种，
+ * target 传「某某群」也命中。命中多个时取文本最短、层级最浅的那个
  * （避免点到把整块包住的外层容器）。
  */
 const clickShareTarget = (label) => `(() => {
@@ -582,8 +582,8 @@ const clickShareTarget = (label) => `(() => {
     .filter((e) => {
       const t = (e.innerText || '').trim().replace(/\\s+/g, ' ');
       if (e.children.length > 2) return false;
-      // startsWith 优先：面板条目是「八方来财 65 分享」这种，
-      // 而评论区的「@八方来财 你说得对」也能 includes 命中 → 会点错地方
+      // startsWith 优先：面板条目是「某某群 65 分享」这种，
+      // 而评论区的「@某某群 你说得对」也能 includes 命中 → 会点错地方
       return t.startsWith(want) || t.includes(want);
     })
     .sort((a, b) => {
