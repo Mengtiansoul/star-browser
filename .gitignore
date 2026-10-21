@@ -27,3 +27,4 @@ launch.ps1
 start-host.ps1
 start-host-hidden.vbs
 start-launch-hidden.vbs
+examples/*/config.json

@@ -46,18 +46,38 @@ const HOST = (process.env.STAR_BROWSER_HOST || 'http://127.0.0.1:9443').replace(
 const SESSION_ID = process.env.DOUYIN_SESSION_ID || 'douyin-worker-1';
 const RPC_TIMEOUT = 60000;
 
-/** 每日浏览上限（秒） */
-const BROWSE_LIMIT_SEC = Number(process.env.DOUYIN_BROWSE_LIMIT_SEC || 3600);
+import { loadConfig, DEFAULT_CONFIG } from './lib/config-store.mjs';
+
 /** 两次 douyin_next 间隔在 [1s, 120s] 内才计入浏览时长 */
 const MIN_GAP_MS = 1000;
 const MAX_GAP_MS = 120000;
-/** 转发配额 */
-const GROUP_FORWARD_LIMIT = Number(process.env.DOUYIN_GROUP_FORWARD_LIMIT || 5);
-const PRIVATE_FORWARD_LIMIT = Number(process.env.DOUYIN_PRIVATE_FORWARD_LIMIT || 3);
-/** 质量闸门：点赞数低于这个值不许互动 */
-const MIN_DIGG = Number(process.env.DOUYIN_MIN_DIGG || 5000);
-/** 每日自动回复上限（防封号） */
-const DAILY_REPLY_LIMIT = Number(process.env.DOUYIN_REPLY_LIMIT || 20);
+
+/**
+ * 运行期配置（config.json）。每次工具调用前调 reloadCfg()，
+ * 所以设置面板里点保存后，下一次操作就生效 —— 不用重启宿主。
+ * 文件坏了就沿用上一份，不让工具直接崩。
+ */
+let CFG = DEFAULT_CONFIG;
+function reloadCfg() {
+  try {
+    CFG = loadConfig();
+  } catch {
+    /* config.json 坏了：保持上一份可用配置 */
+  }
+  return CFG;
+}
+
+/** 限额读数（每次现取，别缓存成常量） */
+function lim() {
+  const l = (CFG && CFG.limits) || DEFAULT_CONFIG.limits;
+  return {
+    browseSec: Math.max(1, Number(l.browseMinutes) || 60) * 60,
+    group: Number(l.groupForwards ?? 5),
+    private: Number(l.privateForwards ?? 3),
+    replies: Number(l.replies ?? 10),
+    minDigg: Number(l.minDigg ?? 5000),
+  };
+}
 
 const OUTPUT_TEXT = {
   schema: { type: 'object', additionalProperties: false, properties: { text: { type: 'string' } }, required: ['text'] },
@@ -123,12 +143,12 @@ function saveState(s) {
 
 /** 浏览时长到了没有 */
 function browseBlocked(st) {
-  return st.browseSeconds >= BROWSE_LIMIT_SEC;
+  return st.browseSeconds >= lim().browseSec;
 }
 
 function browseBlockedText(st) {
   const mins = Math.round(st.browseSeconds / 60);
-  return `⛔ 今日浏览已达上限（${Math.round(BROWSE_LIMIT_SEC / 60)} 分钟，已刷 ${mins} 分钟），不再下滑。\n` +
+  return `⛔ 今日浏览已达上限（${Math.round(lim().browseSec / 60)} 分钟，已刷 ${mins} 分钟），不再下滑。\n` +
     `明天 0 点自动重置（state.json 的 date 变了就清零）。`;
 }
 
@@ -319,8 +339,8 @@ const VISION_DEFAULT_PROMPT = [
 ].join('\n');
 
 function visionConfigured() {
-  const k = process.env.VISION_API_KEY;
-  return !!(k && String(k).trim());
+  const k = (CFG.vision && CFG.vision.apiKey) || '';
+  return !!String(k).trim();
 }
 
 /**
@@ -329,12 +349,13 @@ function visionConfigured() {
  */
 async function askVisionModel(imagePath, prompt) {
   if (!visionConfigured()) return { ok: false, code: 'NO_KEY' };
-  const base = (process.env.VISION_API_BASE || 'https://dashscope.aliyuncs.com/compatible-mode/v1').replace(/\/+$/, '');
-  const primary = process.env.VISION_MODEL || 'qwen-vl-plus';
+  const v = CFG.vision || DEFAULT_CONFIG.vision;
+  const base = String(v.apiBase || 'https://dashscope.aliyuncs.com/compatible-mode/v1').replace(/\/+$/, '');
+  const primary = v.model || 'qwen-vl-plus';
   // 有些账号没开通 qwen-vl 系列（会返回 404 model_not_found），
   // 这里给一个降级链：主模型挂了就试下一个（实测 qwen3.8-omni-flash 能看图）
-  const fallbacks = String(process.env.VISION_MODEL_FALLBACKS || 'qwen3.8-omni-flash')
-    .split(',').map((s) => s.trim()).filter(Boolean);
+  const fallbacks = (Array.isArray(v.fallbacks) ? v.fallbacks : ['qwen3.8-omni-flash'])
+    .map((s) => String(s).trim()).filter(Boolean);
   const models = [primary, ...fallbacks].filter((m, i, a) => a.indexOf(m) === i);
 
   for (const model of models) {
@@ -354,10 +375,10 @@ async function askVisionModel(imagePath, prompt) {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          Authorization: 'Bearer ' + process.env.VISION_API_KEY,
+          Authorization: 'Bearer ' + ((CFG.vision && CFG.vision.apiKey) || ''),
         },
         body: JSON.stringify(body),
-        signal: AbortSignal.timeout(90000),
+        signal: AbortSignal.timeout(Math.max(10, Number(CFG.vision && CFG.vision.timeoutSec) || 90) * 1000),
       });
       if (res.status === 404) {
         // 模型不存在 → 换下一个候选；都换完了才报错
@@ -429,18 +450,18 @@ async function qualityGate(actionLabel, st) {
   if (q.count == null) {
     return { count: null, warn: null, note: `⚠️ 没能解析点赞数（原文「${q.raw}」），这次没有数值参考` };
   }
-  if (q.count < MIN_DIGG) {
+  if (q.count < lim().minDigg) {
     // 只记一笔「提醒过几次」，方便事后回看；不阻止任何操作
     st.lowQualityWarnings = (st.lowQualityWarnings || 0) + 1;
     saveState(st);
     return {
       count: q.count,
-      warn: `⚠️ 点赞数偏低（${q.count} < ${MIN_DIGG}）。先 douyin_evaluate 或 douyin_look 看一眼画面再决定，` +
+      warn: `⚠️ 点赞数偏低（${q.count} < ${lim().minDigg}）。先 douyin_evaluate 或 douyin_look 看一眼画面再决定，` +
         `不拦你：真要${actionLabel}就执行，觉得不值就 douyin_next 走人。`,
-      note: `点赞数 ${q.count}（${q.source}），低于参考线 ${MIN_DIGG}`,
+      note: `点赞数 ${q.count}（${q.source}），低于参考线 ${lim().minDigg}`,
     };
   }
-  return { count: q.count, warn: null, note: `点赞数 ${q.count}（${q.source}）≥ ${MIN_DIGG}` };
+  return { count: q.count, warn: null, note: `点赞数 ${q.count}（${q.source}）≥ ${lim().minDigg}` };
 }
 
 // ------------------------------------------------------------
@@ -712,6 +733,7 @@ const clickShareTarget = (label) => `(() => {
 // 工具注册
 // ------------------------------------------------------------
 async function withHost(fn, label) {
+  reloadCfg(); // 每次工具调用都读一次 config.json —— 面板保存后立刻生效
   if (!(await hostAlive())) return { text: HOST_DOWN };
   try {
     return await fn();
@@ -727,7 +749,7 @@ async function apply(ctx) {
   const WORKFLOW_HINT =
     '刷推荐流的标准循环：douyin_state 看进度/点赞数 → 想判断内容好坏就 douyin_evaluate（或 douyin_look+read_image）→ 再 douyin_next ' +
     '（一次一条，别连点）→ 想互动再 douyin_like / douyin_favorite / douyin_comment。' +
-    `注意：点赞数 < ${MIN_DIGG} 的会被质量闸门拦掉；每天浏览上限 ${Math.round(BROWSE_LIMIT_SEC / 60)} 分钟，` +
+    `注意：点赞数 < ${lim().minDigg} 的会被质量闸门拦掉；每天浏览上限 ${Math.round(lim().browseSec / 60)} 分钟，` +
     '到点 douyin_next 会直接拒绝。';
 
   // ---- 搜索 ----
@@ -748,9 +770,9 @@ async function apply(ctx) {
       if (!r.items.length) return { text: '没拿到视频列表。' + (r.hint || '') };
       const lines = [`✅ 从接口拿到 ${r.total} 条（源: ${r.source}）`, ''];
       r.items.forEach((it, i) => {
-        const ok = typeof it.digg === 'number' && it.digg >= MIN_DIGG;
+        const ok = typeof it.digg === 'number' && it.digg >= lim().minDigg;
         lines.push(`${i + 1}. ${ok ? '' : '⚠️'}${it.desc || '(无标题)'}`);
-        lines.push(`   @${it.author} | 赞 ${it.digg ?? '?'}${ok ? '' : `（低于 ${MIN_DIGG}，建议先看画面）`} | 评论 ${it.comment ?? '?'} | ${it.url}`);
+        lines.push(`   @${it.author} | 赞 ${it.digg ?? '?'}${ok ? '' : `（低于 ${lim().minDigg}，建议先看画面）`} | 评论 ${it.comment ?? '?'} | ${it.url}`);
       });
       lines.push('', '下一步：douyin_open 序号 打开某条；或 douyin_next 在页面上滑');
       return { text: lines.join('\n') };
@@ -830,9 +852,9 @@ async function apply(ctx) {
       const lines = [`✅ 滑了 ${times} 次`];
       moved.forEach((m, i) => lines.push(`  ${i + 1}. 播放进度 ${m.from ?? '?'}s → ${m.to ?? '?'}s`));
       if (after) {
-        lines.push(`当前: ${after.title || '(无标题)'} | 点赞 ${after.diggText || '?'}${q != null && q < MIN_DIGG ? '（低于参考线，先看画面）' : ''}`);
+        lines.push(`当前: ${after.title || '(无标题)'} | 点赞 ${after.diggText || '?'}${q != null && q < lim().minDigg ? '（低于参考线，先看画面）' : ''}`);
       }
-      lines.push(`今日浏览: ${Math.round(st.browseSeconds / 60)} 分钟 / 上限 ${Math.round(BROWSE_LIMIT_SEC / 60)} 分钟` +
+      lines.push(`今日浏览: ${Math.round(st.browseSeconds / 60)} 分钟 / 上限 ${Math.round(lim().browseSec / 60)} 分钟` +
         (counted ? `（本次 +${counted}s）` : '（间隔太久，这次不计时）'));
       return { text: lines.join('\n') };
     }, 'next'),
@@ -862,8 +884,8 @@ async function apply(ctx) {
           `标题: ${st.title || '(无)'}`,
           `播放: ${st.playing ? '是' : '否'} | ${st.currentTime}s / ${st.duration}s | 视频元素 ${st.videoCount} 个`,
           `点赞: ${on(st.diggState)}（${st.diggText || '?'}${digg != null ? ' ≈ ' + digg : ''}）| 收藏: ${on(st.collectState)} | 评论框: ${st.commentOpen ? '已打开' : '未打开'}`,
-          `质量闸门: ${digg == null ? '解析不出点赞数，本次不判' : digg >= MIN_DIGG ? '达标（可互动）' : `偏低（< ${MIN_DIGG}，只提醒）`}`,
-          `今日: 浏览 ${Math.round(s.browseSeconds / 60)}/${Math.round(BROWSE_LIMIT_SEC / 60)} 分钟 | 赞 ${s.likes} 藏 ${s.favorites} 评 ${s.comments} | 转发 群 ${s.groupForwards}/${GROUP_FORWARD_LIMIT} 私 ${s.privateForwards}/${PRIVATE_FORWARD_LIMIT}`,
+          `质量闸门: ${digg == null ? '解析不出点赞数，本次不判' : digg >= lim().minDigg ? '达标（可互动）' : `偏低（< ${lim().minDigg}，只提醒）`}`,
+          `今日: 浏览 ${Math.round(s.browseSeconds / 60)}/${Math.round(lim().browseSec / 60)} 分钟 | 赞 ${s.likes} 藏 ${s.favorites} 评 ${s.comments} | 转发 群 ${s.groupForwards}/${lim().group} 私 ${s.privateForwards}/${lim().private}`,
           '',
           '👉 想看画面质量：douyin_look 截图 → read_image 看 → 再决定互动还是滑走。',
         ].join('\n'),
@@ -930,7 +952,7 @@ async function apply(ctx) {
       const q = st ? parseCount(st.diggText) : null;
       const meta = [
         `标题: ${(st && st.title) || '(未知)'}`,
-        `点赞: ${(st && st.diggText) || '?'}${q != null ? ' ≈ ' + q + (q < MIN_DIGG ? `（低于参考线 ${MIN_DIGG}，仅供参考）` : '') : ''}`,
+        `点赞: ${(st && st.diggText) || '?'}${q != null ? ' ≈ ' + q + (q < lim().minDigg ? `（低于参考线 ${lim().minDigg}，仅供参考）` : '') : ''}`,
       ];
       if (!visionConfigured()) {
         return {
@@ -943,7 +965,9 @@ async function apply(ctx) {
           ].join('\n'),
         };
       }
-      const r = await askVisionModel(shot.path, args.prompt ? String(args.prompt) : VISION_DEFAULT_PROMPT);
+      const custom = (CFG.vision && CFG.vision.prompt) || '';
+      const prompt = args.prompt ? String(args.prompt) : (custom.trim() || VISION_DEFAULT_PROMPT);
+      const r = await askVisionModel(shot.path, prompt);
       if (!r.ok) {
         return {
           text: [
@@ -1079,7 +1103,7 @@ async function apply(ctx) {
       '把当前视频分享出去。true 情况说明：分享面板里实测有「群聊」和「好友」条目与「复制链接」，' +
       '但**点击后能否真的送达未经验证**（旧版插件实测点完后群里收不到）。' +
       '所以默认 mode=panel 只打开面板列出可选目标；mode=send 才真点，结果标 uncertain。' +
-      `配额：群 ${GROUP_FORWARD_LIMIT} 条/天、私聊 ${PRIVATE_FORWARD_LIMIT} 条/天。`,
+      `配额：群 ${lim().group} 条/天、私聊 ${lim().private} 条/天。`,
     parameters: {
       type: 'object', additionalProperties: false,
       mode: { type: 'string', description: 'panel(默认，只列目标) / send(真发) / copy(点复制链接)' },
@@ -1098,7 +1122,7 @@ async function apply(ctx) {
         if (!kind) throw new Error('send 需要 kind=group 或 kind=private（用来记账）');
         if (!args.target) throw new Error('send 需要 target（目标名称要和面板里完全一致）');
         const used = kind === 'group' ? st.groupForwards : st.privateForwards;
-        const limit = kind === 'group' ? GROUP_FORWARD_LIMIT : PRIVATE_FORWARD_LIMIT;
+        const limit = kind === 'group' ? lim().group : lim().private;
         if (used >= limit) {
           return { text: `⛔ 今日${kind === 'group' ? '群' : '私聊'}转发配额已用完（${used}/${limit}）。明天 0 点重置。` };
         }
@@ -1118,7 +1142,7 @@ async function apply(ctx) {
             '📋 分享面板已打开，可选目标：',
             ...parsed.items.map((x) => `  · ${x.raw}${x.name && x.name !== x.raw ? `   → target 可写「${x.name}」` : ''}`),
             '',
-            `今日配额：群 ${st.groupForwards}/${GROUP_FORWARD_LIMIT}、私聊 ${st.privateForwards}/${PRIVATE_FORWARD_LIMIT}`,
+            `今日配额：群 ${st.groupForwards}/${lim().group}、私聊 ${st.privateForwards}/${lim().private}`,
             '要真的发：mode=send + target=<上面某个名字> + kind=group|private（target 用包含匹配，写前半段就行）',
             '⚠️ 提醒：面板入口存在，但点击后的送达**未经验证**（旧版实测点完群里收不到）。',
           ].join('\n'),
@@ -1141,7 +1165,7 @@ async function apply(ctx) {
       saveState(st);
 
       const usedNow = args.kind === 'group' ? st.groupForwards : st.privateForwards;
-      const limit = args.kind === 'group' ? GROUP_FORWARD_LIMIT : PRIVATE_FORWARD_LIMIT;
+      const limit = args.kind === 'group' ? lim().group : lim().private;
       return {
         text: [
           `已点击目标「${args.target}」（${args.kind}）`,
@@ -1257,7 +1281,7 @@ async function apply(ctx) {
     description:
       `给指定会话发文本消息。**默认只填草稿不发送**，要真发传 send=true。` +
       `发出去就是真的发给真人了（对外可见，撤不回来），确认过再发。` +
-      `每日自动回复上限 ${DAILY_REPLY_LIMIT} 条（防封号），用完就拒。`,
+      `每日自动回复上限 ${lim().replies} 条（防封号），用完就拒。`,
     parameters: {
       type: 'object', additionalProperties: false,
       target: { type: 'string', description: '会话名（模糊匹配）' },
@@ -1272,8 +1296,8 @@ async function apply(ctx) {
       if (!args.text) throw new Error('需要 text');
       const st = loadState();
       const doSend = !!args.send;
-      if (doSend && st.replies >= DAILY_REPLY_LIMIT) {
-        return { text: `⛔ 今日自动回复已达上限（${st.replies}/${DAILY_REPLY_LIMIT} 条），今天的私信不再自动发。明天 0 点重置。` };
+      if (doSend && st.replies >= lim().replies) {
+        return { text: `⛔ 今日自动回复已达上限（${st.replies}/${lim().replies} 条），今天的私信不再自动发。明天 0 点重置。` };
       }
       await openChatByName(args.target);
       if (args.clear) {
@@ -1303,7 +1327,7 @@ async function apply(ctx) {
         st.replies += 1;
         saveState(st);
         lines.push(`✅ 已发送（回车提交，输入框已清空）`);
-        lines.push(`今日自动回复: ${st.replies}/${DAILY_REPLY_LIMIT}`);
+        lines.push(`今日自动回复: ${st.replies}/${lim().replies}`);
       } else {
         lines.push('⚠️ 按了回车但输入框还有内容，可能没发出去（抖音可能要求点发送按钮，或有风控）');
       }
@@ -1322,11 +1346,11 @@ async function apply(ctx) {
       return {
         text: [
           `日期: ${s.date}`,
-          `浏览: ${Math.round(s.browseSeconds / 60)} 分钟 / ${Math.round(BROWSE_LIMIT_SEC / 60)} 分钟` +
-            (s.browseSeconds >= BROWSE_LIMIT_SEC ? '（已达上限，douyin_next 会被拒）' : ''),
+          `浏览: ${Math.round(s.browseSeconds / 60)} 分钟 / ${Math.round(lim().browseSec / 60)} 分钟` +
+            (s.browseSeconds >= lim().browseSec ? '（已达上限，douyin_next 会被拒）' : ''),
           `互动: 赞 ${s.likes} / 藏 ${s.favorites} / 评 ${s.comments}`,
-          `转发: 群 ${s.groupForwards}/${GROUP_FORWARD_LIMIT}、私聊 ${s.privateForwards}/${PRIVATE_FORWARD_LIMIT}`,
-          `点赞数偏低提醒过: ${s.lowQualityWarnings || 0} 次（参考线 ${MIN_DIGG} 赞，不拦操作）`,
+          `转发: 群 ${s.groupForwards}/${lim().group}、私聊 ${s.privateForwards}/${lim().private}`,
+          `点赞数偏低提醒过: ${s.lowQualityWarnings || 0} 次（参考线 ${lim().minDigg} 赞，不拦操作）`,
           `状态文件: ${STATE_FILE}`,
         ].join('\n'),
       };

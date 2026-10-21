@@ -1,0 +1,8 @@
+# 繁星抖音助手 —— profile 层补丁
+# 两个 entry：工具本体（index.mjs）+ 设置面板的宿主半身（ui/host.mjs）
+# entry 名用**本包内的相对路径**（裸包名在 profile 的 ESM 解析基点下会 MODULE_NOT_FOUND）
+- insert:
+    - id: douyin-on-base
+      name: './index.mjs'
+    - id: douyin-on-base-ui
+      name: './ui/host.mjs'
