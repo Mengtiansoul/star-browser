@@ -2,43 +2,60 @@
 // 抖音插件（基于 star-browser 基座 v0.3.0）
 //
 // 能力：
-//   · 专属 sessionId —— 自己一张页，不和别的插件抢
-//   · get_network_log —— 从接口 JSON 拿视频元数据，不解析 DOM
-//   · eval 注入 —— 合成 ArrowDown 滑动、派发鼠标序列触发点赞/收藏
+//   · 专属 sessionId、接口 JSON（不走 DOM）、eval 注入滑动/点击
+//   · 每日状态存储 + 防沉迷计时 + 转发配额 + 质量闸门
 //
 // 安装：dsh plugin add link:D:/Deepseek-Harness/Fan_xing/browser/examples/douyin-on-base
 // 依赖：star-browser 管家在线（star-browser --detach）
 //
 // ════════════════════════════════════════════════════════════
-// 实测结论（2026-10-22，Edge 155 + 已登录抖音号；改代码前先看这里）
+// 实测结论（2026-10-22，Edge 155 + 已登录抖音号；改代码前先看）
 // ════════════════════════════════════════════════════════════
-// 1) 搜索页走 XHR：/aweme/v1/web/general/search/single/ 返回完整 JSON，
-//    data[].aweme_info 有 aweme_id / desc / author / statistics，单条约 900KB。
-// 2) **推荐流不走 XHR**（React Server Components 首屏直出）。网络日志里只有
-//    danmaku / stats / history 这些旁路请求，feed 元数据只能从 DOM 读。
-// 3) 滑动：eval 里合成 KeyboardEvent(ArrowDown) 有效；被拦就退 press。
-// 4) 点赞 / 收藏：按钮虽然渲染了，但 **getBoundingClientRect 是 0x0**（完全隐藏），
-//    Playwright 的 normal click 会被「element is not visible」拦下。
-//    正解 = 往里派发完整鼠标序列（pointerdown → mousedown → pointerup →
-//    mouseup → click），React 的合成事件监听在容器上，冒泡到了就生效。
-//    实测：video-player-no-digged → video-player-is-digged（再点一次可撤销）。
-// 5) 评论框：不是一直存在的 contenteditable！
-//    .comment-input-inner-container 里先是个占位符「留下你的精彩评论吧」，
-//    **点它之后**才挂出 Draft.js 编辑器（div.public-DraftEditor-content）。
-//    Draft.js 只认真键盘事件（管家的 type 用 pressSequentially，可用）；
-//    直接改 innerText 不会触发 React onChange。
-//    清空用 Control+a + Delete（会剩一个 \n，是 Draft.js 空状态，正常）。
-// 6) 点赞 / 收藏 / 发评论都是**对外可见**动作：作者能看到。工具默认只做
-//    「点一下」和「填草稿」，发评论必须显式传 send:true 才真发。
+// 1) 搜索页走 XHR：/aweme/v1/web/general/search/single/ → data[].aweme_info
+//    有 aweme_id / desc / author / statistics，单条约 900KB。
+// 2) **推荐流不走 XHR**（React Server Components 首屏直出），网络日志只有
+//    danmaku / stats / history 旁路请求，feed 元数据只能读 DOM。
+// 3) 滑动：合成 KeyboardEvent(ArrowDown) 有效，被拦退 press。
+// 4) 点赞/收藏按钮 **getBoundingClientRect 是 0x0**，Playwright 普通 click 被
+//    「element is not visible」拦，必须派发完整鼠标序列（pointerdown →
+//    mousedown → pointerup → mouseup → click）。
+// 5) 评论框要先点占位符（.comment-input-inner-container 里的 div._x9Gwl7G）
+//    才会挂出 Draft.js 编辑器；Draft.js 只认真键盘（管家的 type 可用）。
+//    清空 = Control+a + Delete（会剩一个 \n，是空状态）。
+// 6) 点赞数在 DOM：`[data-e2e="video-player-digg"]` 的 innerText，
+//    实测值是 "7.9万" 这种短单位格式 → 必须写单位解析。
+// 7) 分享面板（点 video-player-share）里实测能看到：
+//    「分享给朋友」分组 + 群条目（如「八方来财 65 分享」）+ 好友条目 +
+//    「复制链接」按钮。**但入口存在 ≠ 送达可靠**：旧插件实测点完后群里
+//    收不到、回执永远是「未确认」。所以 douyin_share 默认 dryRun，
+//   真发送要显式 send:true，且结果标 uncertain（不谎报送达）。
+// 8) 点赞/收藏/发评论都是对外可见动作；发评论默认只填草稿。
 // ============================================================
+
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 const name = 'douyin-on-base';
 const inject = ['tools'];
 
+const HERE = path.dirname(fileURLToPath(import.meta.url));
+const STATE_FILE = path.join(HERE, 'state.json');
+
 const HOST = (process.env.STAR_BROWSER_HOST || 'http://127.0.0.1:9443').replace(/\/+$/, '');
-/** 本插件专属页面；固定一个，管家重启后还是同一张页 */
 const SESSION_ID = process.env.DOUYIN_SESSION_ID || 'douyin-worker-1';
 const RPC_TIMEOUT = 60000;
+
+/** 每日浏览上限（秒） */
+const BROWSE_LIMIT_SEC = Number(process.env.DOUYIN_BROWSE_LIMIT_SEC || 3600);
+/** 两次 douyin_next 间隔在 [1s, 120s] 内才计入浏览时长 */
+const MIN_GAP_MS = 1000;
+const MAX_GAP_MS = 120000;
+/** 转发配额 */
+const GROUP_FORWARD_LIMIT = Number(process.env.DOUYIN_GROUP_FORWARD_LIMIT || 5);
+const PRIVATE_FORWARD_LIMIT = Number(process.env.DOUYIN_PRIVATE_FORWARD_LIMIT || 3);
+/** 质量闸门：点赞数低于这个值不许互动 */
+const MIN_DIGG = Number(process.env.DOUYIN_MIN_DIGG || 5000);
 
 const OUTPUT_TEXT = {
   schema: { type: 'object', additionalProperties: false, properties: { text: { type: 'string' } }, required: ['text'] },
@@ -47,6 +64,90 @@ const OUTPUT_TEXT = {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+// ------------------------------------------------------------
+// 状态存储（每日重置）
+// ------------------------------------------------------------
+function today() {
+  const d = new Date();
+  const p = (n) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+}
+
+function blankState() {
+  return {
+    date: today(),
+    browseSeconds: 0,
+    groupForwards: 0,
+    privateForwards: 0,
+    lastNextTime: 0,
+    likes: 0,
+    favorites: 0,
+    comments: 0,
+    skippedLowQuality: 0,
+  };
+}
+
+const NUMERIC_KEYS = ['browseSeconds', 'groupForwards', 'privateForwards', 'lastNextTime', 'likes', 'favorites', 'comments', 'skippedLowQuality'];
+
+/** 读 state.json；跨天自动清零 */
+function loadState() {
+  let s = null;
+  try {
+    s = JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'));
+  } catch { /* 第一次跑或文件坏了 */ }
+  if (!s || typeof s !== 'object' || Array.isArray(s)) {
+    s = blankState();
+    saveState(s);
+    return s;
+  }
+  if (s.date !== today()) {
+    s = blankState();
+    saveState(s);
+    return s;
+  }
+  for (const k of NUMERIC_KEYS) {
+    if (typeof s[k] !== 'number' || !Number.isFinite(s[k])) s[k] = 0;
+  }
+  return s;
+}
+
+function saveState(s) {
+  try {
+    fs.mkdirSync(path.dirname(STATE_FILE), { recursive: true });
+    fs.writeFileSync(STATE_FILE, JSON.stringify(s, null, 2), 'utf8');
+  } catch { /* 只读环境下不致命，但计时会丢 */ }
+}
+
+/** 浏览时长到了没有 */
+function browseBlocked(st) {
+  return st.browseSeconds >= BROWSE_LIMIT_SEC;
+}
+
+function browseBlockedText(st) {
+  const mins = Math.round(st.browseSeconds / 60);
+  return `⛔ 今日浏览已达上限（${Math.round(BROWSE_LIMIT_SEC / 60)} 分钟，已刷 ${mins} 分钟），不再下滑。\n` +
+    `明天 0 点自动重置（state.json 的 date 变了就清零）。`;
+}
+
+// ------------------------------------------------------------
+// 数值解析："7.9万" / "1.2w" / "1,234" / "3.1亿"
+// ------------------------------------------------------------
+function parseCount(text) {
+  const s = String(text == null ? '' : text).replace(/[,，\s]/g, '');
+  const m = s.match(/(\d+(?:\.\d+)?)\s*(亿|万|w|W|e|k|K)?/);
+  if (!m) return null;
+  let n = parseFloat(m[1]);
+  if (!Number.isFinite(n)) return null;
+  const unit = m[2];
+  if (unit === '万' || unit === 'w' || unit === 'W') n *= 1e4;
+  else if (unit === '亿' || unit === 'e') n *= 1e8;
+  else if (unit === 'k' || unit === 'K') n *= 1e3;
+  return Math.round(n);
+}
+
+// ------------------------------------------------------------
+// RPC 基础
+// ------------------------------------------------------------
 async function rpc(op, body = {}) {
   const res = await fetch(HOST + '/rpc', {
     method: 'POST',
@@ -72,7 +173,7 @@ let lastAwemes = [];
 // ------------------------------------------------------------
 // 页面脚本片段
 // ------------------------------------------------------------
-/** 派发完整鼠标序列（隐藏按钮也能触发 React 处理） */
+/** 派发完整鼠标序列（0x0 的隐藏按钮也能触发 React） */
 const fireClick = (e2e) => `(() => {
   const d = document.querySelector('[data-e2e="${e2e}"]');
   if (!d) return { ok: false, error: '元素不存在: ${e2e}' };
@@ -91,15 +192,21 @@ const fireClick = (e2e) => `(() => {
   return { ok: true, rect: [Math.round(r.width), Math.round(r.height)] };
 })()`;
 
-/** 读某个反应按钮的状态（video-player-no-digged / is-digged …） */
 const reactionState = (e2e) => `(() => {
   const d = document.querySelector('[data-e2e="${e2e}"]');
   return d ? (d.getAttribute('data-e2e-state') || '') : '';
 })()`;
 
+/** 点赞数字文本（"7.9万" 这种） */
+const DIGG_TEXT_EXPR = `(() => {
+  const d = document.querySelector('[data-e2e="video-player-digg"]');
+  return d ? (d.innerText || '').trim() : '';
+})()`;
+
 const STATE_EXPR = `(() => {
   const vids = [...document.querySelectorAll('video')];
   const v = vids.find((x) => !x.paused) || vids[0] || null;
+  const diggEl = document.querySelector('[data-e2e="video-player-digg"]');
   return {
     url: location.href,
     title: document.title || '',
@@ -107,13 +214,14 @@ const STATE_EXPR = `(() => {
     currentTime: v ? Math.round(v.currentTime) : 0,
     duration: v ? Math.round(v.duration || 0) : 0,
     videoCount: vids.length,
-    diggState: document.querySelector('[data-e2e="video-player-digg"]')?.getAttribute('data-e2e-state') || '',
+    diggText: diggEl ? (diggEl.innerText || '').trim() : '',
+    diggState: diggEl ? (diggEl.getAttribute('data-e2e-state') || '') : '',
     collectState: document.querySelector('[data-e2e="video-player-collect"]')?.getAttribute('data-e2e-state') || '',
     commentOpen: !!document.querySelector('.comment-input-inner-container [contenteditable="true"]'),
   };
 })()`;
 
-/** 合成 ArrowDown：抖音网页版就是靠这个换下一条 */
+/** 合成 ArrowDown：抖音网页版靠这个换下一条 */
 const SLIDE_EXPR = `(() => {
   const ev = { key: 'ArrowDown', code: 'ArrowDown', keyCode: 40, which: 40, bubbles: true, cancelable: true };
   window.dispatchEvent(new KeyboardEvent('keydown', ev));
@@ -131,6 +239,49 @@ async function evalOnPage(expression, timeout = 15000) {
 
 async function pageState() {
   return await evalOnPage(STATE_EXPR, 8000);
+}
+
+// ------------------------------------------------------------
+// 质量闸门
+// ------------------------------------------------------------
+/**
+ * 当前视频的点赞数。
+ * 优先用接口里带过来的 aweme 数据（搜索过来的那条），否则读 DOM 文本。
+ * @returns {{count:number|null, source:string, raw:string}}
+ */
+async function currentQuality() {
+  // 1) 接口数据：URL 里如果有 video/<id>，在最近一次搜索缓存里找
+  const st = await pageState().catch(() => null);
+  const url = (st && st.url) || '';
+  const idMatch = url.match(/\/video\/(\d+)/);
+  if (idMatch) {
+    const hit = lastAwemes.find((a) => a.aweme_id === idMatch[1]);
+    if (hit && typeof hit.digg === 'number') {
+      return { count: hit.digg, source: 'api(search)', raw: String(hit.digg) };
+    }
+  }
+  // 2) DOM 文本
+  const raw = await evalOnPage(DIGG_TEXT_EXPR, 8000).catch(() => '');
+  return { count: parseCount(raw), source: 'dom', raw: String(raw || '') };
+}
+
+/** 互动前的统一闸门：返回 null 表示放行，否则返回拦截文案 */
+async function qualityGate(actionLabel, st) {
+  const q = await currentQuality();
+  if (q.count == null) {
+    // 解析不出来就放行但提示（避免因为页面改版直接把功能全卡死）
+    return { blocked: false, note: `⚠️ 没能解析点赞数（原文「${q.raw}」），这次不做质量判定` };
+  }
+  if (q.count < MIN_DIGG) {
+    st.skippedLowQuality += 1;
+    saveState(st);
+    return {
+      blocked: true,
+      text: `⛔ 视频质量未达标（点赞 ${q.count} < ${MIN_DIGG}），跳过${actionLabel}，建议直接滑走：\n` +
+        `  douyin_next\n（今天已因质量跳过 ${st.skippedLowQuality} 次）`,
+    };
+  }
+  return { blocked: false, note: `点赞数 ${q.count}（${q.source}）≥ ${MIN_DIGG}，放行` };
 }
 
 // ------------------------------------------------------------
@@ -166,7 +317,7 @@ async function searchAwemes(keyword, { limit = 20, reopen = true } = {}) {
   const log = await rpc('get_network_log', {
     limit: 20,
     urlFilter: 'general/search',
-    maxBytes: 6_000_000, // 抖音这条 900KB 级，默认预算会截断
+    maxBytes: 6_000_000,
   });
   if (!log.ok) throw new Error(log.error || 'get_network_log failed');
   const entries = (log.entries || []).filter((e) => e.json);
@@ -178,13 +329,8 @@ async function searchAwemes(keyword, { limit = 20, reopen = true } = {}) {
 }
 
 // ------------------------------------------------------------
-// 互动动作（点赞 / 收藏）
+// 点赞 / 收藏
 // ------------------------------------------------------------
-/**
- * 把某个反应按钮拨到目标状态。
- * @param {string} e2e 按钮的 data-e2e
- * @param {boolean} want true=想要已激活，false=想要取消
- */
 async function setReaction(e2e, want) {
   const before = await evalOnPage(reactionState(e2e), 8000);
   const isOn = String(before).includes('is-');
@@ -229,7 +375,6 @@ const COMMENT = {
   })()`,
 };
 
-/** 打开评论输入框：点评论图标 → 点占位符 → 等 Draft.js 编辑器出现 */
 async function ensureCommentBox() {
   if (await evalOnPage(COMMENT.check, 8000)) return true;
   await evalOnPage(fireClick('feed-comment-icon'), 8000).catch(() => {});
@@ -239,6 +384,72 @@ async function ensureCommentBox() {
   await sleep(1200);
   return !!(await evalOnPage(COMMENT.check, 8000));
 }
+
+// ------------------------------------------------------------
+// 分享 / 转发
+// ------------------------------------------------------------
+/** 打开分享面板并列出可选的转发目标（只读，不点） */
+const listShareTargets = `(() => {
+  const items = [...document.querySelectorAll('div,span,button')]
+    .filter((e) => {
+      const t = (e.innerText || '').trim();
+      if (!t || t.length > 24) return false;
+      if (e.children.length > 2) return false;
+      if (/(分享|回复)/.test(t) && t.split('\\n').length > 1) return false;   // 跳过评论区的「N 分享 回复」
+      return /(分享|群|好友|复制链接|微信|QQ|朋友圈|微博)/.test(t);
+    })
+    .map((e) => {
+      const raw = (e.innerText || '').trim().replace(/\\s+/g, ' ');
+      // 抖音的条目文字会带后缀：「八方来财 65 分享」「某某24分钟前在线分享」「复制链接抖音 app 扫码观看」
+      // 给一个可当 target 用的干净名字，raw 保留原样
+      const name = raw
+        .replace(/\\s*抖音\\s*app\\s*扫码观看$/i, '')
+        .replace(/\\s*\\d+\\s*分钟前在线\\s*/g, ' ')
+        .replace(/\\s*分享$/g, '')
+        .replace(/\\s+/g, ' ')
+        .trim();
+      return { raw, name };
+    })
+    .filter((v, i, a) => a.findIndex((x) => x.raw === v.raw) === i);
+  return JSON.stringify({ count: items.length, items: items.slice(0, 20) });
+})()`;
+
+/**
+ * 点某个分享目标。
+ * 用**包含匹配**而不是全等：面板里的文字是「八方来财 65 分享」这种，
+ * target 传「八方来财」也命中。命中多个时取文本最短、层级最浅的那个
+ * （避免点到把整块包住的外层容器）。
+ */
+const clickShareTarget = (label) => `(() => {
+  const want = ${JSON.stringify(label)};
+  const cands = [...document.querySelectorAll('div,span,button')]
+    .filter((e) => {
+      const t = (e.innerText || '').trim().replace(/\\s+/g, ' ');
+      if (e.children.length > 2) return false;
+      // startsWith 优先：面板条目是「八方来财 65 分享」这种，
+      // 而评论区的「@八方来财 你说得对」也能 includes 命中 → 会点错地方
+      return t.startsWith(want) || t.includes(want);
+    })
+    .sort((a, b) => {
+      const ta = (a.innerText || '').trim().replace(/\\s+/g, ' ');
+      const tb = (b.innerText || '').trim().replace(/\\s+/g, ' ');
+      const sa = ta.startsWith(want) ? 0 : 1;
+      const sb = tb.startsWith(want) ? 0 : 1;
+      return sa - sb || ta.length - tb.length || a.children.length - b.children.length;
+    });
+  if (!cands.length) return { ok: false, error: '没找到目标: ' + want };
+  const el = cands[0];
+  const matched = (el.innerText || '').trim().replace(/\\s+/g, ' ');
+  const r = el.getBoundingClientRect();
+  const o = { bubbles: true, cancelable: true, view: window,
+    clientX: r.x + Math.max(1, r.width / 2), clientY: r.y + Math.max(1, r.height / 2), button: 0 };
+  el.dispatchEvent(new PointerEvent('pointerdown', o));
+  el.dispatchEvent(new MouseEvent('mousedown', o));
+  el.dispatchEvent(new PointerEvent('pointerup', o));
+  el.dispatchEvent(new MouseEvent('mouseup', o));
+  el.dispatchEvent(new MouseEvent('click', o));
+  return { ok: true, matched, startsWith: matched.startsWith(want) };
+})()`;
 
 // ------------------------------------------------------------
 // 工具注册
@@ -257,10 +468,12 @@ async function apply(ctx) {
   const tools = [];
 
   const WORKFLOW_HINT =
-    '刷推荐流的标准循环：先 douyin_state 看当前进度/是否在播 → 该换就 douyin_next' +
+    '刷推荐流的标准循环：douyin_state 看进度（顺便看点赞数）→ 达标就 douyin_next ' +
     '（一次一条，别连点）→ 想互动再 douyin_like / douyin_favorite / douyin_comment。' +
-    '任何一步失败先 douyin_state 确认还在视频页，必要时 douyin_next 一次再继续。';
+    `注意：点赞数 < ${MIN_DIGG} 的会被质量闸门拦掉；每天浏览上限 ${Math.round(BROWSE_LIMIT_SEC / 60)} 分钟，` +
+    '到点 douyin_next 会直接拒绝。';
 
+  // ---- 搜索 ----
   tools.push({
     name: 'douyin_search',
     description: '在抖音搜关键词，返回视频列表(标题/作者/点赞)。数据来自接口 JSON，不解析 DOM。',
@@ -278,17 +491,19 @@ async function apply(ctx) {
       if (!r.items.length) return { text: '没拿到视频列表。' + (r.hint || '') };
       const lines = [`✅ 从接口拿到 ${r.total} 条（源: ${r.source}）`, ''];
       r.items.forEach((it, i) => {
-        lines.push(`${i + 1}. ${it.desc || '(无标题)'}`);
-        lines.push(`   @${it.author} | 赞 ${it.digg ?? '?'} | 评论 ${it.comment ?? '?'} | ${it.url}`);
+        const ok = typeof it.digg === 'number' && it.digg >= MIN_DIGG;
+        lines.push(`${i + 1}. ${ok ? '' : '⚠️'}${it.desc || '(无标题)'}`);
+        lines.push(`   @${it.author} | 赞 ${it.digg ?? '?'}${ok ? '' : `（低于 ${MIN_DIGG}，互动会被拦）`} | 评论 ${it.comment ?? '?'} | ${it.url}`);
       });
       lines.push('', '下一步：douyin_open 序号 打开某条；或 douyin_next 在页面上滑');
       return { text: lines.join('\n') };
     }, 'search'),
   });
 
+  // ---- 打开 ----
   tools.push({
     name: 'douyin_open',
-    description: '按 douyin_search 的序号或 aweme_id 打开视频详情页（打开后可直接点赞/收藏/评论）。',
+    description: '按 douyin_search 的序号或 aweme_id 打开视频详情页。',
     parameters: {
       type: 'object', additionalProperties: false,
       index: { type: 'number', description: 'douyin_search 结果里的序号(从 1 开始)' },
@@ -309,14 +524,15 @@ async function apply(ctx) {
       const st = await pageState().catch(() => null);
       return {
         text: `✅ 已打开 ${id}\n标题: ${(st && st.title) || r.title || ''}\n` +
-          (st ? `播放: ${st.playing ? '是' : '否'} | ${st.currentTime}s/${st.duration}s | 视频元素 ${st.videoCount} 个` : ''),
+          (st ? `播放: ${st.playing ? '是' : '否'} | ${st.currentTime}s/${st.duration}s | 点赞 ${st.diggText || '?'}` : ''),
       };
     }, 'open'),
   });
 
+  // ---- 下滑（含防沉迷计时）----
   tools.push({
     name: 'douyin_next',
-    description: '往下滑切下一条视频（eval 注入 ArrowDown，不依赖元素定位）。一次一条，别连点。' + WORKFLOW_HINT,
+    description: '往下滑切下一条视频（eval 注入 ArrowDown）。' + WORKFLOW_HINT,
     parameters: {
       type: 'object', additionalProperties: false,
       times: { type: 'number', description: '滑几次(默认 1，最多 10)' },
@@ -324,48 +540,78 @@ async function apply(ctx) {
     timeoutMs: 120000,
     output: OUTPUT_TEXT,
     execute: (args) => withHost(async () => {
+      const st = loadState();
+      if (browseBlocked(st)) return { text: browseBlockedText(st) };
+
       const times = Math.min(Math.max(Number(args.times) || 1, 1), 10);
       const moved = [];
+      const now = Date.now();
+
+      // 防呆计时：只有「1 秒 ~ 2 分钟」的间隔才算连着刷
+      const gap = st.lastNextTime ? now - st.lastNextTime : 0;
+      let counted = 0;
+      if (st.lastNextTime && gap >= MIN_GAP_MS && gap <= MAX_GAP_MS) {
+        counted = Math.round(gap / 1000);
+        st.browseSeconds += counted;
+      }
+      st.lastNextTime = now;
+      saveState(st);
+
+      if (browseBlocked(st)) return { text: browseBlockedText(st) };
+
       for (let i = 0; i < times; i++) {
         const before = await pageState().catch(() => null);
         const r = await rpc('eval', { expression: SLIDE_EXPR, timeout: 8000 });
-        if (!r.ok) await rpc('press', { key: 'ArrowDown' }); // 合成被拦就退真按键
-        await sleep(1000 + Math.floor(Math.random() * 900));  // 拟人，别连点
+        if (!r.ok) await rpc('press', { key: 'ArrowDown' });
+        await sleep(1000 + Math.floor(Math.random() * 900));
         const after = await pageState().catch(() => null);
         moved.push({ from: before && before.currentTime, to: after && after.currentTime });
       }
-      const st = await pageState().catch(() => null);
+
+      const after = await pageState().catch(() => null);
+      const q = after ? parseCount(after.diggText) : null;
       const lines = [`✅ 滑了 ${times} 次`];
       moved.forEach((m, i) => lines.push(`  ${i + 1}. 播放进度 ${m.from ?? '?'}s → ${m.to ?? '?'}s`));
-      if (st) lines.push(`当前: ${st.title || '(无标题)'} | ${st.url}`);
+      if (after) {
+        lines.push(`当前: ${after.title || '(无标题)'} | 点赞 ${after.diggText || '?'}${q != null && q < MIN_DIGG ? '（低于闸门，别互动）' : ''}`);
+      }
+      lines.push(`今日浏览: ${Math.round(st.browseSeconds / 60)} 分钟 / 上限 ${Math.round(BROWSE_LIMIT_SEC / 60)} 分钟` +
+        (counted ? `（本次 +${counted}s）` : '（间隔太久，这次不计时）'));
       return { text: lines.join('\n') };
     }, 'next'),
   });
 
+  // ---- 状态 ----
   tools.push({
     name: 'douyin_state',
-    description: '读当前视频页状态：是否在播 / 进度 / 时长 / 标题 / 点赞收藏是否已激活 / 评论框开没开。' +
-      '刷推荐流时用它监控进度，决定什么时候 douyin_next。',
+    description: '读当前视频状态：是否在播 / 进度 / 标题 / 点赞数 / 点赞收藏是否已激活 / 评论框。' +
+      '刷流时用它监控进度和点赞数（决定该不该互动）。',
     parameters: { type: 'object', additionalProperties: false },
     timeoutMs: 45000,
     output: OUTPUT_TEXT,
     execute: () => withHost(async () => {
       const st = await pageState();
-      const on = (s) => (String(s).includes('is-') ? '已' : '未');
+      const s = loadState();
+      const on = (x) => (String(x).includes('is-') ? '已' : '未');
+      const digg = parseCount(st.diggText);
       return {
         text: [
           `网址: ${st.url}`,
           `标题: ${st.title || '(无)'}`,
-          `播放: ${st.playing ? '是' : '否'} | ${st.currentTime}s / ${st.duration}s | 页面视频元素 ${st.videoCount} 个`,
-          `点赞: ${on(st.diggState)} | 收藏: ${on(st.collectState)} | 评论框: ${st.commentOpen ? '已打开' : '未打开'}`,
+          `播放: ${st.playing ? '是' : '否'} | ${st.currentTime}s / ${st.duration}s | 视频元素 ${st.videoCount} 个`,
+          `点赞: ${on(st.diggState)}（${st.diggText || '?'}${digg != null ? ' ≈ ' + digg : ''}）| 收藏: ${on(st.collectState)} | 评论框: ${st.commentOpen ? '已打开' : '未打开'}`,
+          `质量闸门: ${digg == null ? '解析不出点赞数，本次不判' : digg >= MIN_DIGG ? '达标（可互动）' : `未达标（< ${MIN_DIGG}，互动会被拦）`}`,
+          `今日: 浏览 ${Math.round(s.browseSeconds / 60)}/${Math.round(BROWSE_LIMIT_SEC / 60)} 分钟 | 赞 ${s.likes} 藏 ${s.favorites} 评 ${s.comments} | 转发 群 ${s.groupForwards}/${GROUP_FORWARD_LIMIT} 私 ${s.privateForwards}/${PRIVATE_FORWARD_LIMIT}`,
         ].join('\n'),
       };
     }, 'state'),
   });
 
+  // ---- 点赞 ----
   tools.push({
     name: 'douyin_like',
-    description: '给当前视频点赞（对外可见，作者能看到）。默认 like；已点过不会重复点。传 action=unlike 可取消。',
+    description: `给当前视频点赞（对外可见）。已点过不会重复点。传 action=unlike 取消。` +
+      `点赞数低于 ${MIN_DIGG} 会被质量闸门拦掉。`,
     parameters: {
       type: 'object', additionalProperties: false,
       action: { type: 'string', description: 'like(默认) / unlike' },
@@ -373,20 +619,26 @@ async function apply(ctx) {
     timeoutMs: 60000,
     output: OUTPUT_TEXT,
     execute: (args) => withHost(async () => {
+      const st = loadState();
       const want = (args.action || 'like') === 'like';
+      const gate = await qualityGate('点赞', st);
+      if (gate.blocked) return { text: gate.text };
       const r = await setReaction('video-player-digg', want);
+      if (r.changed) { st.likes += want ? 1 : -1; if (st.likes < 0) st.likes = 0; saveState(st); }
       if (!r.changed && r.note) return { text: `没动：点赞${want ? '已经是开着的' : '本来就是关着的'}（${r.after}）` };
       return {
-        text: (want ? '✅ 已点赞' : '✅ 已取消点赞') +
-          `\n状态: ${r.before || '(空)'} → ${r.after || '(空)'}` +
+        text: (want ? '✅ 已点赞' : '✅ 已取消点赞') + `\n状态: ${r.before || '(空)'} → ${r.after || '(空)'}` +
+          (gate.note ? '\n' + gate.note : '') +
           (r.changed ? '' : '\n⚠️ 状态没变化，可能被风控或页面结构变了'),
       };
     }, 'like'),
   });
 
+  // ---- 收藏 ----
   tools.push({
     name: 'douyin_favorite',
-    description: '收藏当前视频（对外可见）。默认 on；已收藏不会重复。传 action=off 取消收藏。',
+    description: `收藏当前视频（对外可见）。已收藏不会重复。传 action=off 取消。` +
+      `点赞数低于 ${MIN_DIGG} 会被质量闸门拦掉。`,
     parameters: {
       type: 'object', additionalProperties: false,
       action: { type: 'string', description: 'on(默认) / off' },
@@ -394,21 +646,26 @@ async function apply(ctx) {
     timeoutMs: 60000,
     output: OUTPUT_TEXT,
     execute: (args) => withHost(async () => {
+      const st = loadState();
       const want = (args.action || 'on') !== 'off';
+      const gate = await qualityGate('收藏', st);
+      if (gate.blocked) return { text: gate.text };
       const r = await setReaction('video-player-collect', want);
+      if (r.changed) { st.favorites += want ? 1 : -1; if (st.favorites < 0) st.favorites = 0; saveState(st); }
       if (!r.changed && r.note) return { text: `没动：收藏${want ? '已经收藏过了' : '本来就没收藏'}（${r.after}）` };
       return {
-        text: (want ? '✅ 已收藏' : '✅ 已取消收藏') +
-          `\n状态: ${r.before || '(空)'} → ${r.after || '(空)'}` +
+        text: (want ? '✅ 已收藏' : '✅ 已取消收藏') + `\n状态: ${r.before || '(空)'} → ${r.after || '(空)'}` +
+          (gate.note ? '\n' + gate.note : '') +
           (r.changed ? '' : '\n⚠️ 状态没变化，可能被风控或页面结构变了'),
       };
     }, 'favorite'),
   });
 
+  // ---- 评论 ----
   tools.push({
     name: 'douyin_comment',
-    description: '在当前视频下写评论。默认只填草稿不发送（安全）；要真发必须传 send=true。' +
-      '清空用 clear=true。' + WORKFLOW_HINT,
+    description: `在当前视频下写评论。默认只填草稿不发送；要真发必须传 send=true。` +
+      `点赞数低于 ${MIN_DIGG} 会被质量闸门拦掉。` + WORKFLOW_HINT,
     parameters: {
       type: 'object', additionalProperties: false,
       text: { type: 'string', description: '评论内容' },
@@ -418,6 +675,10 @@ async function apply(ctx) {
     timeoutMs: 90000,
     output: OUTPUT_TEXT,
     execute: (args) => withHost(async () => {
+      const st = loadState();
+      const gate = await qualityGate('评论', st);
+      if (gate.blocked) return { text: gate.text };
+
       const opened = await ensureCommentBox();
       if (!opened) return { text: '❌ 没打开评论输入框（评论区可能没加载出来，先 douyin_state 看看是不是在视频页）' };
       if (args.clear) {
@@ -428,11 +689,7 @@ async function apply(ctx) {
       }
       if (!args.text && !args.clear) throw new Error('需要 text，或 clear=true 先清空');
       if (args.text) {
-        const t = await rpc('type', {
-          selector: COMMENT.editorSel,
-          text: String(args.text),
-          replace: !!args.clear,
-        });
+        const t = await rpc('type', { selector: COMMENT.editorSel, text: String(args.text), replace: !!args.clear });
         if (!t.ok) throw new Error(t.error || '输入失败');
         await sleep(500);
       }
@@ -443,7 +700,13 @@ async function apply(ctx) {
         await rpc('press', { key: 'Enter' });
         await sleep(1500);
         const after = await evalOnPage(COMMENT.text, 8000);
-        lines.push(after ? '⚠️ 按了回车但输入框还有内容，可能没发出去（风控/需要点发送按钮）' : '✅ 已发送（输入框已清空）');
+        if (after) {
+          lines.push('⚠️ 按了回车但输入框还有内容，可能没发出去（风控/需要点发送按钮）');
+        } else {
+          st.comments += 1;
+          saveState(st);
+          lines.push('✅ 已发送（输入框已清空）');
+        }
       } else {
         lines.push('（只填了草稿，没发送。要发出去再加 send=true）');
       }
@@ -451,6 +714,89 @@ async function apply(ctx) {
     }, 'comment'),
   });
 
+  // ---- 分享 / 转发 ----
+  tools.push({
+    name: 'douyin_share',
+    description:
+      '把当前视频分享出去。true 情况说明：分享面板里实测有「群聊」和「好友」条目与「复制链接」，' +
+      '但**点击后能否真的送达未经验证**（旧版插件实测点完后群里收不到）。' +
+      '所以默认 mode=panel 只打开面板列出可选目标；mode=send 才真点，结果标 uncertain。' +
+      `配额：群 ${GROUP_FORWARD_LIMIT} 条/天、私聊 ${PRIVATE_FORWARD_LIMIT} 条/天。`,
+    parameters: {
+      type: 'object', additionalProperties: false,
+      mode: { type: 'string', description: 'panel(默认，只列目标) / send(真发) / copy(点复制链接)' },
+      target: { type: 'string', description: '目标名称（群名或好友昵称，需与面板里的文字完全一致）' },
+      kind: { type: 'string', description: 'group / private（send 时必填，用来记账）' },
+    },
+    timeoutMs: 90000,
+    output: OUTPUT_TEXT,
+    execute: (args) => withHost(async () => {
+      const st = loadState();
+      const mode = args.mode || 'panel';
+
+      // 配额检查（只有 send 才消耗）
+      if (mode === 'send') {
+        const kind = args.kind === 'group' ? 'group' : args.kind === 'private' ? 'private' : null;
+        if (!kind) throw new Error('send 需要 kind=group 或 kind=private（用来记账）');
+        if (!args.target) throw new Error('send 需要 target（目标名称要和面板里完全一致）');
+        const used = kind === 'group' ? st.groupForwards : st.privateForwards;
+        const limit = kind === 'group' ? GROUP_FORWARD_LIMIT : PRIVATE_FORWARD_LIMIT;
+        if (used >= limit) {
+          return { text: `⛔ 今日${kind === 'group' ? '群' : '私聊'}转发配额已用完（${used}/${limit}）。明天 0 点重置。` };
+        }
+      }
+
+      // 打开分享面板
+      const open = await evalOnPage(fireClick('video-player-share'), 8000);
+      if (!open || !open.ok) throw new Error((open && open.error) || '没找到分享按钮');
+      await sleep(2500);
+      const list = await evalOnPage(listShareTargets, 8000);
+
+      if (mode === 'panel') {
+        let parsed = { count: 0, items: [] };
+        try { parsed = JSON.parse(list); } catch {}
+        return {
+          text: [
+            '📋 分享面板已打开，可选目标：',
+            ...parsed.items.map((x) => `  · ${x.raw}${x.name && x.name !== x.raw ? `   → target 可写「${x.name}」` : ''}`),
+            '',
+            `今日配额：群 ${st.groupForwards}/${GROUP_FORWARD_LIMIT}、私聊 ${st.privateForwards}/${PRIVATE_FORWARD_LIMIT}`,
+            '要真的发：mode=send + target=<上面某个名字> + kind=group|private（target 用包含匹配，写前半段就行）',
+            '⚠️ 提醒：面板入口存在，但点击后的送达**未经验证**（旧版实测点完群里收不到）。',
+          ].join('\n'),
+        };
+      }
+
+      if (mode === 'copy') {
+        const r = await evalOnPage(clickShareTarget('复制链接'), 8000);
+        if (!r || !r.ok) return { text: '⚠️ 没找到「复制链接」按钮：' + ((r && r.error) || '') };
+        return { text: '✅ 已点「复制链接」（链接进了浏览器剪贴板；管家是无头/独立 profile，读不到系统剪贴板）' };
+      }
+
+      // send
+      const r = await evalOnPage(clickShareTarget(args.target), 8000);
+      if (!r || !r.ok) throw new Error((r && r.error) || '没点到目标');
+      await sleep(2000);
+      // 记账：即使未确认送达也记（保守，避免超额）
+      if (args.kind === 'group') st.groupForwards += 1;
+      else st.privateForwards += 1;
+      saveState(st);
+
+      const usedNow = args.kind === 'group' ? st.groupForwards : st.privateForwards;
+      const limit = args.kind === 'group' ? GROUP_FORWARD_LIMIT : PRIVATE_FORWARD_LIMIT;
+      return {
+        text: [
+          `已点击目标「${args.target}」（${args.kind}）`,
+          `今日配额：${usedNow}/${limit}`,
+          '⚠️ 送达状态：**未确认**（unconfirmed）。',
+          '抖音网页版分享面板点击后没有可读的成功回执；旧版实测出现过「点了但群里没收到」。',
+          '要确认是否真发出去，得去对应的群/私聊里看一眼。',
+        ].join('\n'),
+      };
+    }, 'share'),
+  });
+
+  // ---- 接口日志 ----
   tools.push({
     name: 'douyin_api_log',
     description: '查看本插件页面最近抓到的接口原始返回。调试接口变化时用。',
@@ -483,6 +829,29 @@ async function apply(ctx) {
       }
       return { text: lines.join('\n') };
     }, 'api_log'),
+  });
+
+  // ---- 今日用量 ----
+  tools.push({
+    name: 'douyin_usage',
+    description: '看今天的用量：浏览时长、点赞/收藏/评论次数、转发配额还剩多少、因质量跳过了几次。',
+    parameters: { type: 'object', additionalProperties: false },
+    timeoutMs: 30000,
+    output: OUTPUT_TEXT,
+    execute: () => withHost(async () => {
+      const s = loadState();
+      return {
+        text: [
+          `日期: ${s.date}`,
+          `浏览: ${Math.round(s.browseSeconds / 60)} 分钟 / ${Math.round(BROWSE_LIMIT_SEC / 60)} 分钟` +
+            (s.browseSeconds >= BROWSE_LIMIT_SEC ? '（已达上限，douyin_next 会被拒）' : ''),
+          `互动: 赞 ${s.likes} / 藏 ${s.favorites} / 评 ${s.comments}`,
+          `转发: 群 ${s.groupForwards}/${GROUP_FORWARD_LIMIT}、私聊 ${s.privateForwards}/${PRIVATE_FORWARD_LIMIT}`,
+          `因质量未达标跳过: ${s.skippedLowQuality} 次（阈值 ${MIN_DIGG} 赞）`,
+          `状态文件: ${STATE_FILE}`,
+        ].join('\n'),
+      };
+    }, 'usage'),
   });
 
   ctx.effect(() => {

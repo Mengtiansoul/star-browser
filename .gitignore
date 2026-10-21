@@ -17,3 +17,5 @@ _export_*/
 hsts3*/
 e2e-test.mjs
 package-lock.json
+
+examples/*/state.json
