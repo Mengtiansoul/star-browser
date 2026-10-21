@@ -959,7 +959,22 @@ const server = http.createServer(async (req, res) => {
         case 'screenshot': {
           const nm = (rpc.name || ('shot-' + Date.now())) + '.png';
           const fp = path.join(SHOTS, nm);
-          await page.screenshot({ path: fp, fullPage: !!rpc.fullPage });
+          const opts = { path: fp, fullPage: !!rpc.fullPage };
+          // 区域截图：clip 是**页面坐标**（不是视口坐标），调用方要自己加上
+          // scrollX/scrollY。只截视频画面就靠它（2026-10-22 加）。
+          if (rpc.clip && typeof rpc.clip === 'object' && !opts.fullPage) {
+            const c = rpc.clip;
+            const x = Number(c.x);
+            const y = Number(c.y);
+            const w = Number(c.width);
+            const h = Number(c.height);
+            if ([x, y, w, h].every(Number.isFinite) && w > 1 && h > 1) {
+              opts.clip = { x: Math.max(0, x), y: Math.max(0, y), width: w, height: h };
+            } else {
+              return send(400, { ok: false, error: 'clip 需要合法的 {x,y,width,height}' });
+            }
+          }
+          await page.screenshot(opts);
           return send(200, { ok: true, path: fp });
         }
         case 'close': {

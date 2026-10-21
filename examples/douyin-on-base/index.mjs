@@ -221,6 +221,27 @@ const STATE_EXPR = `(() => {
   };
 })()`;
 
+/**
+ * 视频元素的**页面坐标**（截图 clip 用的就是这套坐标，所以要加 scroll 偏移）。
+ * 拿不到（视频没渲染/尺寸过小）就返回 null，由调用方退化成整视口截图。
+ */
+const VIDEO_RECT_EXPR = `(() => {
+  const vids = [...document.querySelectorAll('video')];
+  const v = vids.find((x) => !x.paused) || vids[0];
+  if (!v) return null;
+  const r = v.getBoundingClientRect();
+  if (r.width < 50 || r.height < 50) return null;
+  return {
+    x: Math.round(r.x + window.scrollX),
+    y: Math.round(r.y + window.scrollY),
+    width: Math.round(r.width),
+    height: Math.round(r.height),
+    playing: !v.paused,
+    currentTime: Math.round(v.currentTime),
+    duration: Math.round(v.duration || 0),
+  };
+})()`;
+
 /** 合成 ArrowDown：抖音网页版靠这个换下一条 */
 const SLIDE_EXPR = `(() => {
   const ev = { key: 'ArrowDown', code: 'ArrowDown', keyCode: 40, which: 40, bubbles: true, cancelable: true };
@@ -239,6 +260,44 @@ async function evalOnPage(expression, timeout = 15000) {
 
 async function pageState() {
   return await evalOnPage(STATE_EXPR, 8000);
+}
+
+// ------------------------------------------------------------
+// 视觉感知：截视频画面
+// ------------------------------------------------------------
+/**
+ * 截一张当前视频的画面（只截 video 元素那块，拿不到就当整视口截）。
+ * 返回本地 PNG 绝对路径，模型用 read_image 打开就能看见。
+ */
+async function lookAtVideo({ mode = 'video' } = {}) {
+  let rect = null;
+  if (mode !== 'viewport') {
+    rect = await evalOnPage(VIDEO_RECT_EXPR, 8000).catch(() => null);
+  }
+  const clip = rect
+    ? { x: rect.x, y: rect.y, width: rect.width, height: rect.height }
+    : null;
+  const safeSid = SESSION_ID.replace(/[^\w-]/g, '');
+  const nm = `dy-${safeSid}-${Date.now()}`;
+  const r = await rpc('screenshot', { name: nm, clip });
+  if (!r.ok) throw new Error(r.error || 'screenshot failed');
+  sweepShots(r.path);
+  return { path: r.path, rect, mode: clip ? 'video' : 'viewport' };
+}
+
+/** 自己的截图别堆成山：超过 40 张先删最老的 */
+function sweepShots(samplePath) {
+  try {
+    const dir = path.dirname(samplePath);
+    const mine = fs.readdirSync(dir)
+      .filter((f) => f.startsWith('dy-') && f.endsWith('.png'))
+      .map((f) => ({ f, t: fs.statSync(path.join(dir, f)).mtimeMs }))
+      .sort((a, b) => a.t - b.t);
+    while (mine.length > 40) {
+      const old = mine.shift();
+      try { fs.unlinkSync(path.join(dir, old.f)); } catch {}
+    }
+  } catch { /* 清理失败不影响截图本身 */ }
 }
 
 // ------------------------------------------------------------
@@ -584,8 +643,11 @@ async function apply(ctx) {
   // ---- 状态 ----
   tools.push({
     name: 'douyin_state',
-    description: '读当前视频状态：是否在播 / 进度 / 标题 / 点赞数 / 点赞收藏是否已激活 / 评论框。' +
-      '刷流时用它监控进度和点赞数（决定该不该互动）。',
+    description:
+      '读当前视频状态：是否在播 / 进度 / 标题 / 点赞数 / 点赞收藏是否已激活 / 评论框 / 今日用量。' +
+      '⚠️ 只看标题和点赞数是不够的：**想评估这个视频到底值不值得互动，先调 douyin_look 截一张画面，' +
+      '再用 read_image 看那张图**，然后把「画面内容 + 标题 + 作者 + 点赞数」放在一起综合判断，' +
+      '再决定 douyin_like / douyin_favorite / douyin_comment 还是直接 douyin_next 走人。',
     parameters: { type: 'object', additionalProperties: false },
     timeoutMs: 45000,
     output: OUTPUT_TEXT,
@@ -602,9 +664,49 @@ async function apply(ctx) {
           `点赞: ${on(st.diggState)}（${st.diggText || '?'}${digg != null ? ' ≈ ' + digg : ''}）| 收藏: ${on(st.collectState)} | 评论框: ${st.commentOpen ? '已打开' : '未打开'}`,
           `质量闸门: ${digg == null ? '解析不出点赞数，本次不判' : digg >= MIN_DIGG ? '达标（可互动）' : `未达标（< ${MIN_DIGG}，互动会被拦）`}`,
           `今日: 浏览 ${Math.round(s.browseSeconds / 60)}/${Math.round(BROWSE_LIMIT_SEC / 60)} 分钟 | 赞 ${s.likes} 藏 ${s.favorites} 评 ${s.comments} | 转发 群 ${s.groupForwards}/${GROUP_FORWARD_LIMIT} 私 ${s.privateForwards}/${PRIVATE_FORWARD_LIMIT}`,
+          '',
+          '👉 想看画面质量：douyin_look 截图 → read_image 看 → 再决定互动还是滑走。',
         ].join('\n'),
       };
     }, 'state'),
+  });
+
+  // ---- 视觉感知：截图 ----
+  tools.push({
+    name: 'douyin_look',
+    description:
+      '给当前视频截一张画面（只截 video 元素那块，不是整页；拿不到视频尺寸时退回整视口），' +
+      '返回本地图片绝对路径，用 read_image 打开就能看见。' +
+      '评估内容质量、判断该不该点赞/收藏/评论之前都应该先看一眼。',
+    parameters: {
+      type: 'object', additionalProperties: false,
+      mode: { type: 'string', description: 'video(默认，只截视频画面) / viewport(整个可见区域)' },
+    },
+    timeoutMs: 60000,
+    output: OUTPUT_TEXT,
+    execute: (args) => withHost(async () => {
+      const mode = args.mode === 'viewport' ? 'viewport' : 'video';
+      const st = await pageState().catch(() => null);
+      const shot = await lookAtVideo({ mode });
+      const q = st ? parseCount(st.diggText) : null;
+      const size = shot.rect ? `${shot.rect.width}x${shot.rect.height}` : '(整视口)';
+      const play = shot.rect
+        ? `${shot.rect.playing ? '播放中' : '暂停'} ${shot.rect.currentTime}s/${shot.rect.duration}s`
+        : (st && st.playing ? '播放中' : '暂停');
+      return {
+        text: [
+          `📸 已截图（${shot.mode === 'video' ? '视频画面区域' : '整个视口'}）`,
+          `路径: ${shot.path}`,
+          '下一步：用 read_image 打开这个路径看画面。',
+          '',
+          `画面尺寸: ${size} | ${play}`,
+          `标题: ${(st && st.title) || '(未知)'} | 作者/点赞: ${(st && st.diggText) || '?'}${q != null ? ' ≈ ' + q : ''}`,
+          '',
+          '看完画面再综合判断：内容值得就 douyin_like / douyin_favorite / douyin_comment（仍要过点赞数闸门），' +
+          '不值得就 douyin_next 直接走。',
+        ].join('\n'),
+      };
+    }, 'look'),
   });
 
   // ---- 点赞 ----
