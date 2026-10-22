@@ -16,7 +16,7 @@
  *   · 任何网络/格式失败都降级成一行可读提示，绝不把设置页搞白屏
  */
 window.__ModuleLoader__.load({
-  id: 'douyin-on-base-ui',
+  id: 'dsh-douyin-on-base-ui',
   factory: function (require) {
     var React = require('react');
     var h = React.createElement;
@@ -108,6 +108,12 @@ window.__ModuleLoader__.load({
           privateForwards: data.config.limits.privateForwards,
           replies: data.config.limits.replies,
           minDigg: data.config.limits.minDigg,
+          browse: !!(data.config.features && data.config.features.browse),
+          like: !!(data.config.features && data.config.features.like),
+          favorite: !!(data.config.features && data.config.features.favorite),
+          comment: !!(data.config.features && data.config.features.comment),
+          share: !!(data.config.features && data.config.features.share),
+          chat: !!(data.config.features && data.config.features.chat),
         });
       }
 
@@ -134,6 +140,14 @@ window.__ModuleLoader__.load({
             prompt: d.prompt,
             timeoutSec: Number(d.timeoutSec),
             fallbacks: String(d.fallbacks || '').split(',').map(function (s) { return s.trim(); }).filter(Boolean),
+          },
+          features: {
+            browse: !!d.browse,
+            like: !!d.like,
+            favorite: !!d.favorite,
+            comment: !!d.comment,
+            share: !!d.share,
+            chat: !!d.chat,
           },
           limits: {
             browseMinutes: Number(d.browseMinutes),
@@ -179,6 +193,34 @@ window.__ModuleLoader__.load({
         );
       }
 
+      /** 单个功能开关（圆角按钮，点一下切状态，改动只落草稿） */
+      function featureRow(key, label, hint) {
+        var on = !!(d && d[key]);
+        return h('div', {
+          key: key,
+          style: {
+            display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '12px',
+            padding: '9px 0', borderTop: '1px solid var(--dsw-alias-border-l1, rgba(127,127,127,.16))',
+          },
+        },
+          h('div', { style: { minWidth: 0 } },
+            h('div', { style: { fontSize: '13px', color: 'var(--dsw-alias-label-primary, inherit)' } }, label),
+            hint ? h('div', { style: { fontSize: '11px', color: 'var(--dsw-alias-label-tertiary, rgba(127,127,127,.9))' } }, hint) : null
+          ),
+          h('button', {
+            type: 'button',
+            onClick: function () {
+              setD(function (p) { var n = Object.assign({}, p); n[key] = !n[key]; return n; });
+            },
+            style: {
+              flexShrink: 0, width: '62px', height: '28px', borderRadius: '999px', cursor: 'pointer',
+              fontSize: '12px', border: 'none', transition: 'background .15s',
+              color: on ? '#fff' : 'var(--dsw-alias-label-secondary, inherit)',
+              background: on ? 'var(--dsw-alias-state-success-primary, #2f9e44)' : 'rgba(127,127,127,.35)',
+            },
+          }, on ? '开启' : '关闭')
+        );
+      }
       var loading = !d || !cfg;
 
       return h('div', { style: C.wrap },
@@ -213,6 +255,21 @@ window.__ModuleLoader__.load({
           )
         ),
 
+        /* ---------- 功能开关 ---------- */
+        h('div', { style: C.card },
+          h('div', { style: C.title }, '功能开关（危险动作默认关）'),
+          h('div', { style: C.hint },
+            '关掉的功能，工具会直接拒绝执行 —— 不点页面、不发消息。保存后下一次调用立即生效。'
+          ),
+          loading ? h('div', { style: C.hint }, '加载中…') : h('div', null,
+            featureRow('browse', '浏览 / 下滑', 'douyin_search / open / next'),
+            featureRow('like', '点赞', 'douyin_like（对外可见）'),
+            featureRow('favorite', '收藏', 'douyin_favorite'),
+            featureRow('comment', '评论', 'douyin_comment（发送仍需 send=true）'),
+            featureRow('share', '视频转发', 'douyin_share（送达未验证）'),
+            featureRow('chat', '私信 / 群聊', 'douyin_list_chats / read_chat / send_chat')
+          )
+        ),
         /* ---------- 安全限额 ---------- */
         h('div', { style: C.card },
           h('div', { style: C.title }, '安全限额（防沉迷 / 防封号）'),
@@ -260,26 +317,33 @@ window.__ModuleLoader__.load({
       return props.children;
     }
 
+    /**
+     * 挂载到设置页。
+     * 参照 dsh-douyin-browser-local（已验证能出现在设置菜单）的写法：
+     *   · 导出里必须带 inject: ['slots']，否则 ctx.slots 不保证可用；
+     *   · 不套 ctx.effect，直接调即可（老插件就这么写的，能正常挂）。
+     */
+    function applyDouyinSettings(ctx) {
+      try {
+        return ctx.slots.inject('settings.section', function () {
+          return ctx.slots.register({
+            name: 'settings.section',
+            id: 'douyin-on-base',
+            order: 120,
+            label: function () { return '抖音助手'; },
+          }, function DouyinSettingsWithBoundary() {
+            return h(Boundary, null, h(Panel, null));
+          });
+        });
+      } catch (e) {
+        return function () {};
+      }
+    }
+
     module.exports = {
-      name: 'douyin-on-base-ui',
-      apply: function (ctx) {
-        ctx.effect(function () {
-          try {
-            return ctx.slots.inject('settings.section', function () {
-              return ctx.slots.register({
-                name: 'settings.section',
-                id: 'douyin-on-base',
-                order: 120,
-                label: function () { return '抖音助手'; },
-              }, function DouyinSettingsWithBoundary() {
-                return h(Boundary, null, h(Panel, null));
-              });
-            });
-          } catch (e) {
-            return function () {};
-          }
-        }, 'douyin-on-base: settings section');
-      },
+      name: 'dsh-douyin-on-base-ui',
+      inject: ['slots'],
+      apply: applyDouyinSettings,
     };
 
     return module.exports;

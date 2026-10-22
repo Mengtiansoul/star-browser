@@ -358,6 +358,14 @@ async function askVisionModel(imagePath, prompt) {
     .map((s) => String(s).trim()).filter(Boolean);
   const models = [primary, ...fallbacks].filter((m, i, a) => a.indexOf(m) === i);
 
+  // 读图并转 base64（上次改降级链时这段被替换块吞掉了，导致 b64 is not defined）
+  let b64;
+  try {
+    b64 = fs.readFileSync(imagePath).toString('base64');
+  } catch (e) {
+    return { ok: false, code: 'READ_FAIL', error: String((e && e.message) || e) };
+  }
+
   for (const model of models) {
     const body = {
       model,
@@ -732,8 +740,31 @@ const clickShareTarget = (label) => `(() => {
 // ------------------------------------------------------------
 // 工具注册
 // ------------------------------------------------------------
-async function withHost(fn, label) {
+/** 功能开关的中文名（拦截文案用） */
+const FEATURE_LABEL = {
+  browse: '浏览/下滑',
+  like: '点赞',
+  favorite: '收藏',
+  comment: '评论',
+  share: '视频转发',
+  chat: '私信/群聊',
+};
+
+/** 开关关了就不执行，连 DOM 都不碰 */
+function featureGate(key) {
+  if (!key) return null;
+  const f = (CFG && CFG.features) || (DEFAULT_CONFIG && DEFAULT_CONFIG.features) || {};
+  if (f[key] !== false) return null;
+  const zh = FEATURE_LABEL[key] || key;
+  return '⛔ 「' + zh + '」功能已在设置面板里关闭（features.' + key + ' = false）。\n' +
+    '如果确实要用，去「设置 → 抖音助手 → 功能开关」打开它，保存后立即生效。\n' +
+    '这一步没有碰页面：不会点任何东西、不会发任何消息。';
+}
+
+async function withHost(fn, label, featureKey) {
   reloadCfg(); // 每次工具调用都读一次 config.json —— 面板保存后立刻生效
+  const blocked = featureGate(featureKey);
+  if (blocked) return { text: blocked };
   if (!(await hostAlive())) return { text: HOST_DOWN };
   try {
     return await fn();
@@ -776,7 +807,7 @@ async function apply(ctx) {
       });
       lines.push('', '下一步：douyin_open 序号 打开某条；或 douyin_next 在页面上滑');
       return { text: lines.join('\n') };
-    }, 'search'),
+    }, 'search', 'browse'),
   });
 
   // ---- 打开 ----
@@ -805,7 +836,7 @@ async function apply(ctx) {
         text: `✅ 已打开 ${id}\n标题: ${(st && st.title) || r.title || ''}\n` +
           (st ? `播放: ${st.playing ? '是' : '否'} | ${st.currentTime}s/${st.duration}s | 点赞 ${st.diggText || '?'}` : ''),
       };
-    }, 'open'),
+    }, 'open', 'browse'),
   });
 
   // ---- 下滑（含防沉迷计时）----
@@ -857,7 +888,7 @@ async function apply(ctx) {
       lines.push(`今日浏览: ${Math.round(st.browseSeconds / 60)} 分钟 / 上限 ${Math.round(lim().browseSec / 60)} 分钟` +
         (counted ? `（本次 +${counted}s）` : '（间隔太久，这次不计时）'));
       return { text: lines.join('\n') };
-    }, 'next'),
+    }, 'next', 'browse'),
   });
 
   // ---- 状态 ----
@@ -1014,7 +1045,7 @@ async function apply(ctx) {
           (gate.warn ? '\n' + gate.warn : gate.note ? '\n' + gate.note : '') +
           (r.changed ? '' : '\n⚠️ 状态没变化，可能被风控或页面结构变了'),
       };
-    }, 'like'),
+    }, 'like', 'like'),
   });
 
   // ---- 收藏 ----
@@ -1040,7 +1071,7 @@ async function apply(ctx) {
           (gate.warn ? '\n' + gate.warn : gate.note ? '\n' + gate.note : '') +
           (r.changed ? '' : '\n⚠️ 状态没变化，可能被风控或页面结构变了'),
       };
-    }, 'favorite'),
+    }, 'favorite', 'favorite'),
   });
 
   // ---- 评论 ----
@@ -1093,7 +1124,7 @@ async function apply(ctx) {
         lines.push('（只填了草稿，没发送。要发出去再加 send=true）');
       }
       return { text: _warn + lines.join('\n') };
-    }, 'comment'),
+    }, 'comment', 'comment'),
   });
 
   // ---- 分享 / 转发 ----
@@ -1175,7 +1206,7 @@ async function apply(ctx) {
           '要确认是否真发出去，得去对应的群/私聊里看一眼。',
         ].join('\n'),
       };
-    }, 'share'),
+    }, 'share', 'share'),
   });
 
   // ---- 接口日志 ----
@@ -1234,7 +1265,7 @@ async function apply(ctx) {
       }
       lines.push('', '下一步：douyin_read_chat target=<上面的名字> 读消息；douyin_send_chat 发消息');
       return { text: lines.join('\n') };
-    }, 'list_chats'),
+    }, 'list_chats', 'chat'),
   });
 
   // ---- 私信/群聊：读消息 ----
@@ -1272,7 +1303,7 @@ async function apply(ctx) {
       if (!data.count) lines.push('(没读到消息：可能是新会话，或页面还没加载完)');
       lines.push('', '发消息：douyin_send_chat target="' + args.target + '" text="..."（默认只填草稿）');
       return { text: lines.join('\n') };
-    }, 'read_chat'),
+    }, 'read_chat', 'chat'),
   });
 
   // ---- 私信/群聊：发消息 ----
@@ -1332,7 +1363,7 @@ async function apply(ctx) {
         lines.push('⚠️ 按了回车但输入框还有内容，可能没发出去（抖音可能要求点发送按钮，或有风控）');
       }
       return { text: lines.join('\n') };
-    }, 'send_chat'),
+    }, 'send_chat', 'chat'),
   });
   // ---- 今日用量 ----
   tools.push({

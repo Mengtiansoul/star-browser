@@ -31,6 +31,18 @@ export const DEFAULT_CONFIG = {
     prompt: '',
     timeoutSec: 90,
   },
+  /**
+   * 功能总开关。关掉 = 工具直接拒绝执行，连 DOM 都不碰。
+   * 默认值按「危险的先关」：评论/转发/私信默认关，点赞开，收藏关。
+   */
+  features: {
+    browse: true,
+    like: true,
+    favorite: false,
+    comment: false,
+    share: false,
+    chat: false,
+  },
   limits: {
     browseMinutes: 60,
     groupForwards: 5,
@@ -198,6 +210,14 @@ export function sanitizePatch(input) {
       const n = Number(v.timeoutSec);
       if (!Number.isFinite(n) || n < 10 || n > 300) return { ok: false, error: 'timeoutSec 要在 10-300 之间' };
       out.vision.timeoutSec = Math.round(n);
+    }
+  }
+  if (isObj(input.features)) {
+    out.features = {};
+    for (const k of Object.keys(DEFAULT_CONFIG.features)) {
+      if (input.features[k] == null) continue;
+      if (typeof input.features[k] !== 'boolean') return { ok: false, error: 'features.' + k + ' 必须是 true/false' };
+      out.features[k] = input.features[k];
     }
   }
   const l = input.limits;
