@@ -42,6 +42,14 @@ const inject = ['tools', 'agents'];
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const STATE_FILE = path.join(HERE, 'state.json');
+const WAKE_LOG = path.join(HERE, 'wake.log');
+
+/** 带时间戳的事件日志：写文件，不依赖宿主日志级别过滤，排查唤醒问题靠它 */
+function wakeLog(line) {
+  try {
+    fs.appendFileSync(WAKE_LOG, new Date().toISOString() + ' ' + line + '\n');
+  } catch { /* 日志写不进去也不能拖挂主流程 */ }
+}
 
 const HOST = (process.env.STAR_BROWSER_HOST || 'http://127.0.0.1:9443').replace(/\/+$/, '');
 const SESSION_ID = process.env.DOUYIN_SESSION_ID || 'douyin-worker-1';
@@ -231,6 +239,7 @@ async function buildUserMessage(text) {
  */
 async function wakeOnNewMessage(ev, logger) {
   if (!activeAgent) {
+    wakeLog('有新消息（added=' + (ev.added || 1) + '）但还没有活跃会话，跳过');
     logger.info('[douyin-on-base] 新消息来了，但还没有活跃会话（工具还没被调用过），这次跳过');
     return;
   }
@@ -244,8 +253,10 @@ async function wakeOnNewMessage(ev, logger) {
       '如果只是别人闲聊、或者跟你无关，就别出声，也别主动发消息。';
     const msg = await buildUserMessage(text);
     activeAgent.followup(msg);
-    logger.info('[douyin-on-base] 已唤醒会话 ' + String(activeAgent.id || '?') + '（新增 ' + (ev.added || 1) + ' 条气泡）');
+    wakeLog('已唤醒会话 ' + String(activeAgent.id || '?') + '（新增 ' + (ev.added || 1) + ' 条气泡，消息源 ' + (msg.source && msg.source.kind) + '）');
+    logger.info('[douyin-on-base] 已唤醒会话 ' + String(activeAgent.id || '?'));
   } catch (e) {
+    wakeLog('唤醒失败: ' + String((e && e.stack) || e).slice(0, 400));
     logger.warn('[douyin-on-base] 唤醒失败: ' + String((e && e.message) || e));
   } finally {
     setTimeout(() => { pendingWake = false; }, 5000);
@@ -1706,6 +1717,7 @@ async function apply(ctx) {
         try {
           const res = await fetch(HOST + '/events', { headers: { accept: 'text/event-stream' } });
           if (!res.ok || !res.body) throw new Error('SSE ' + res.status);
+          wakeLog('SSE 已连上 ' + HOST + '/events');
           logger.info('[douyin-on-base] SSE 已连上：' + HOST + '/events');
           const reader = res.body.getReader();
           const dec = new TextDecoder();
