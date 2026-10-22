@@ -94,8 +94,29 @@ export function apply(ctx) {
 
         const url = new URL(req.url, 'http://127.0.0.1');
 
-        // 读配置 + 今日状态
+        // GET 保存兜底：有些环境里浏览器对同源 POST 会莫名挂住（实测：GET 通、POST 不到宿主），
+        // 这里允许 GET /config?patch=<base64(JSON)>，同样走 sanitizePatch 校验。
         if (url.pathname === API_PATH + '/config' && req.method === 'GET') {
+          const patchParam = url.searchParams.get('patch');
+          if (patchParam) {
+            try {
+              const json = Buffer.from(patchParam, 'base64').toString('utf8');
+              const check = sanitizePatch(JSON.parse(json));
+              if (!check.ok) { logReq('  -> patch invalid: ' + check.error); return send(400, { ok: false, error: check.error }); }
+              saveConfig(check.patch);
+              logReq('  -> saved via GET fallback');
+              return send(200, {
+                ok: true,
+                config: maskedForPanel(loadConfig({ seedEnv: false })),
+                state: stateSummary(),
+                savedAt: Date.now(),
+                via: 'get-fallback',
+                note: '已写入 config.json（GET 兜底通道），工具下一次调用就生效',
+              });
+            } catch (e) {
+              return send(400, { ok: false, error: 'patch 解析失败: ' + String((e && e.message) || e) });
+            }
+          }
           let cfg;
           try {
             cfg = loadConfig({ seedEnv: false }); // 面板只看文件值，不掺环境变量

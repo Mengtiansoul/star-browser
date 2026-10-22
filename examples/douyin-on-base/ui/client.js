@@ -25,6 +25,14 @@ window.__ModuleLoader__.load({
 
     var API = '/douyin/api';
 
+    /** UTF-8 安全的 base64（btoa 只吃 latin1，直接塞中文会抛错） */
+    function b64EncodeUtf8(str) {
+      var bytes = new TextEncoder().encode(str);
+      var bin = '';
+      for (var i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+      return btoa(bin);
+    }
+
     /** hooks 兜底：宿主基座 shim 不完整时降级成静态渲染 */
     var useState = typeof React.useState === 'function' ? React.useState : function (v) { return [v, function () {}]; };
     var useEffect = typeof React.useEffect === 'function' ? React.useEffect : function () {};
@@ -146,6 +154,22 @@ window.__ModuleLoader__.load({
       function save() {
         if (!d) return;
         setSaving(true); setErr(''); setInfo('');
+        try {
+          doSave();
+        } catch (e) {
+          // 同步异常（构造 patch / 序列化出错）也要把状态复位，不然按钮永远卡在"保存中…"
+          setSaving(false);
+          setErr('保存时抛错：' + (e && e.message ? e.message : e));
+        }
+      }
+
+      /** GET 兜底：把 patch 塞进 query 里保存 */
+      function saveViaGet(patch) {
+        var b64 = b64EncodeUtf8(JSON.stringify(patch));
+        return getJson('/config?patch=' + encodeURIComponent(b64));
+      }
+
+      function doSave() {
         var patch = {
           vision: {
             apiBase: d.apiBase,
@@ -172,18 +196,35 @@ window.__ModuleLoader__.load({
         };
         // 只有真填了新 key 才提交，留空 = 保持原样
         if (d.apiKey && d.apiKey.trim()) patch.vision.apiKey = d.apiKey.trim();
-        postJson('/config', { config: patch }).then(function (r) {
+
+        function handleResult(r, via) {
           setSaving(false);
           if (r.ok && r.body && r.body.ok) {
-            setInfo('✅ 已保存到 config.json，工具下一次调用就生效（不用重启宿主）');
+            setInfo('✅ 已保存到 config.json' + (via === 'get' ? '（GET 兜底通道）' : '') +
+              '，工具下一次调用就生效，不用重启宿主');
             hydrate(r.body);
             refreshState();
           } else {
             setErr('保存失败：' + ((r.body && r.body.error) || ('HTTP ' + r.status)));
           }
+        }
+
+        postJson('/config', { config: patch }).then(function (r) {
+          if (r.ok && r.body && r.body.ok) return handleResult(r, 'post');
+          // POST 被拒 → 换 GET 兜底再试一次
+          return saveViaGet(patch).then(function (r2) { handleResult(r2, 'get'); })
+            .catch(function () { handleResult(r, 'post'); });
         }).catch(function (e) {
-          setSaving(false);
-          setErr('保存失败：' + (e && e.message ? e.message : e));
+          // POST 根本没发出去（实测有的浏览器/反代环境下会这样）→ 直接走 GET
+          saveViaGet(patch).then(function (r2) {
+            handleResult(r2, 'get');
+            if (!(r2.ok && r2.body && r2.body.ok)) {
+              setErr('保存失败（POST: ' + (e && e.message ? e.message : e) + '；GET 兜底也失败）');
+            }
+          }).catch(function (e2) {
+            setSaving(false);
+            setErr('保存失败（POST 和 GET 都没通）：' + (e && e.message ? e.message : e) + ' / ' + (e2 && e2.message ? e2.message : e2));
+          });
         });
       }
 
