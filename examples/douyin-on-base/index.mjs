@@ -534,7 +534,14 @@ async function setReaction(e2e, want) {
 // 评论区
 // ------------------------------------------------------------
 const COMMENT = {
-  check: `(() => !!document.querySelector('.comment-input-inner-container [contenteditable="true"]'))()`,
+  // 只认「看得见」的编辑器：图文页收起状态的评论区也会把编辑器挂在 DOM 上，
+  // 只看存在性会误判成已打开，后面点它必然 element is not visible 超时。
+  check: `(() => {
+    const ed = document.querySelector('.comment-input-inner-container [contenteditable="true"]');
+    if (!ed) return false;
+    const r = ed.getBoundingClientRect();
+    return r.width > 30 && r.height > 8;
+  })()`,
   activate: `(() => {
     const box = document.querySelector('.comment-input-inner-container');
     if (!box) return { ok: false, error: '评论输入区还没出现' };

@@ -907,10 +907,20 @@ const server = http.createServer(async (req, res) => {
             }
           }
           await loc.scrollIntoViewIfNeeded({ timeout: 5000 }).catch(() => {});
-          await loc.click({ timeout: 8000 });
+          // 点一下让元素获得焦点；有些输入框（比如抖音图文页收起状态的 Draft.js 编辑器）
+          // 虽然挂在 DOM 里但尺寸为 0，Playwright 的 click 会报 element is not visible。
+          // 这时候退化成 JS focus —— 键盘事件照样能进去，不必要求可见。
+          let viaClick = true;
+          try {
+            await loc.click({ timeout: 5000 });
+          } catch (e) {
+            viaClick = false;
+            await loc.evaluate((el) => { try { el.focus(); } catch {} }).catch(() => {});
+            await sleep(150);
+          }
           if (rpc.replace) await loc.fill(rpc.text);
           else await loc.pressSequentially(rpc.text, { delay: 8 });
-          return send(200, { ok: true });
+          return send(200, { ok: true, focusedBy: viaClick ? 'click' : 'js' });
         }
         case 'press': {
           if (!rpc.key) return send(400, { ok: false, error: 'key required' });
