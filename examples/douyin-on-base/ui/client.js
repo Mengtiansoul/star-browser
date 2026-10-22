@@ -26,6 +26,8 @@ window.__ModuleLoader__.load({
     var API = '/douyin/api';
     /** 保存开始时间：用来保证「保存中…」至少显示 SAVE_MIN_MS */
     var savingStartedAt = 0;
+    /** 两个按钮的最小反馈时长（ms）——放最前面，避免 var 提升让 refreshState 读到 undefined */
+    var SAVE_MIN_MS = 900;
 
     /** UTF-8 安全的 base64（btoa 只吃 latin1，直接塞中文会抛错） */
     function b64EncodeUtf8(str) {
@@ -122,6 +124,10 @@ window.__ModuleLoader__.load({
       var refreshingState = useState(false);
       var setRefreshing = refreshingState[1];
       var refreshing = refreshingState[0];
+      // 刷新成功的短暂提示态（2 秒），跟保存按钮保持一致的完成感
+      var refreshedState = useState(false);
+      var justRefreshed = refreshedState[0];
+      var setJustRefreshed = refreshedState[1];
 
       // 草稿：vision / limits
       var draft = useState(null);
@@ -158,20 +164,35 @@ window.__ModuleLoader__.load({
         }).catch(function (e) { setErr('读取配置失败：' + (e && e.message ? e.message : e)); });
       }, []);
 
+      var refreshStartedAt = 0;
+
       function refreshState() {
         if (refreshing) return;
         setRefreshing(true);
+        setJustRefreshed(false);
+        refreshStartedAt = Date.now();
+        var settle = function (ok, payload, errMsg) {
+          // 和保存按钮一样：哪怕瞬时完成，也至少让「刷新中…」露 0.9 秒
+          var wait = Math.max(0, SAVE_MIN_MS - (Date.now() - refreshStartedAt));
+          var finish = function () {
+            setRefreshing(false);
+            if (ok) {
+              setState(payload);
+              setJustRefreshed(true);
+              setTimeout(function () { setJustRefreshed(false); }, 2000);
+            } else {
+              setErr('刷新失败：' + errMsg);
+            }
+          };
+          if (wait > 0) setTimeout(finish, wait); else finish();
+        };
         getJson('/state').then(function (r) {
-          setRefreshing(false);
-          if (r.ok && r.body && r.body.ok) { setState(r.body.state); setInfo('已刷新'); setTimeout(function () { setInfo(''); }, 1500); }
-          else setErr('刷新失败：' + ((r.body && r.body.error) || ('HTTP ' + r.status)));
+          if (r.ok && r.body && r.body.ok) settle(true, r.body.state);
+          else settle(false, null, (r.body && r.body.error) || ('HTTP ' + r.status));
         }).catch(function (e) {
-          setRefreshing(false);
-          setErr('刷新失败：' + (e && e.message ? e.message : e));
+          settle(false, null, e && e.message ? e.message : e);
         });
       }
-
-      var SAVE_MIN_MS = 900;
 
       function save() {
         if (!d || saving) return;
@@ -367,10 +388,14 @@ window.__ModuleLoader__.load({
           h('div', { style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between' } },
             h('div', { style: C.title }, '今日状态'),
             h('button', {
-              style: refreshing ? Object.assign({}, C.btnGhost, { opacity: 0.6, cursor: 'default' }) : C.btnGhost,
+              style: refreshing
+                ? Object.assign({}, C.btnGhost, { background: '#8a94a6', color: '#fff', borderColor: 'transparent', cursor: 'default' })
+                : (justRefreshed
+                    ? Object.assign({}, C.btnGhost, { background: '#2f9e44', color: '#fff', borderColor: 'transparent', cursor: 'default' })
+                    : C.btnGhost),
               disabled: refreshing,
               onClick: refreshState,
-            }, refreshing ? '刷新中…' : '刷新')
+            }, refreshing ? '刷新中…' : (justRefreshed ? '✓ 已刷新' : '刷新'))
           ),
           stateData
             ? h('div', { style: C.grid },
