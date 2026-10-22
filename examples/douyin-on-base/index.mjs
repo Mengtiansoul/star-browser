@@ -671,6 +671,21 @@ async function ensureImPanel() {
 /** 按名字模糊匹配会话并真实点开它（先打标记，再用 Playwright 点击） */
 async function openChatByName(name) {
   if (!(await ensureImPanel())) throw new Error('消息面板没打开（可能被弹窗挡住，或用合成事件点不开）');
+
+  // 聊天窗是盖在会话列表上的一层（data-stack-layer="chat"）。它开着的时候，
+  // 会话行虽然还在 DOM 里、也「可见」，但会被上面那层挡住指针，
+  // Playwright 点它会一直报 "subtree intercepts pointer events" 直到超时。
+  // 所以切换会话前必须先点返回按钮退回列表。
+  const needBack = await evalOnPage(`(() => {
+    const btn = document.querySelector('[data-stack-layer="chat"] .StackLayoutStackTitleBarbackBtn');
+    if (!btn) return false;
+    const r = btn.getBoundingClientRect();
+    return r.width > 4 && r.height > 4;
+  })()`, 8000).catch(() => false);
+  if (needBack) {
+    await rpc('click', { selector: '[data-stack-layer="chat"] .StackLayoutStackTitleBarbackBtn' }).catch(() => {});
+    await sleep(1200);
+  }
   const mark = await evalOnPage(`(() => {
     const want = ${JSON.stringify(String(name))};
     document.querySelectorAll('[data-dy-target]').forEach((e) => e.removeAttribute('data-dy-target'));
