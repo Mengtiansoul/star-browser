@@ -10,10 +10,20 @@
 // 访问守卫：只允许本机回环，或 tailnet 的 *.ts.net（主人偶尔从笔记本开 GUI）。
 // 跨站请求一律拒（看 origin + sec-fetch-site）。
 // ============================================================
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import {
   loadConfig, saveConfig, maskedForPanel, stateSummary, sanitizePatch,
   CONFIG_FILE, STATE_FILE, DEFAULT_CONFIG,
 } from '../lib/config-store.mjs';
+
+const HERE = path.dirname(fileURLToPath(import.meta.url));
+/** 请求日志：面板保存卡住时靠它判断请求到底有没有到宿主 */
+const REQ_LOG = path.join(HERE, '..', 'ui-requests.log');
+function logReq(line) {
+  try { fs.appendFileSync(REQ_LOG, new Date().toISOString() + ' ' + line + '\n'); } catch {}
+}
 
 export const name = 'douyin-on-base-ui';
 /** 只依赖宿主 webServer：开 HTTP 路由给浏览器半身用 */
@@ -75,7 +85,11 @@ export function apply(ctx) {
         } catch { /* 客户端已断开 */ }
       };
       try {
+        logReq(req.method + ' ' + req.url + ' host=' + (req.headers.host || '-') +
+          ' ct=' + (req.headers['content-type'] || '-') +
+          ' site=' + (req.headers['sec-fetch-site'] || '-'));
         const blocked = guard(req);
+        if (blocked) { logReq('  -> blocked ' + blocked.code + ' ' + blocked.error); }
         if (blocked) return send(blocked.code, { ok: false, error: blocked.error });
 
         const url = new URL(req.url, 'http://127.0.0.1');

@@ -29,17 +29,29 @@ window.__ModuleLoader__.load({
     var useState = typeof React.useState === 'function' ? React.useState : function (v) { return [v, function () {}]; };
     var useEffect = typeof React.useEffect === 'function' ? React.useEffect : function () {};
 
-    function getJson(path) {
-      return fetch(API + path, { headers: { accept: 'application/json' } })
-        .then(function (r) { return r.json().then(function (j) { return { ok: r.ok, status: r.status, body: j }; }); });
+    // 请求一律带超时：宿主路由要是卡住，界面会一直显示"保存中…"，看着像按钮坏了
+    var REQ_TIMEOUT_MS = 10000;
+
+    function doFetch(path, init) {
+      var opts = Object.assign({ headers: { accept: 'application/json' } }, init || {});
+      try { opts.signal = AbortSignal.timeout(REQ_TIMEOUT_MS); } catch (e) { /* 老浏览器没有 AbortSignal.timeout */ }
+      return fetch(API + path, opts).then(function (r) {
+        return r.text().then(function (txt) {
+          var body = null;
+          try { body = txt ? JSON.parse(txt) : null; } catch (e) { body = { ok: false, error: '响应不是 JSON: ' + String(txt).slice(0, 120) }; }
+          return { ok: r.ok, status: r.status, body: body };
+        });
+      });
     }
 
+    function getJson(path) { return doFetch(path, {}); }
+
     function postJson(path, payload) {
-      return fetch(API + path, {
+      return doFetch(path, {
         method: 'POST',
         headers: { 'content-type': 'application/json', accept: 'application/json' },
         body: JSON.stringify(payload),
-      }).then(function (r) { return r.json().then(function (j) { return { ok: r.ok, status: r.status, body: j }; }); });
+      });
     }
 
     var C = {
@@ -66,8 +78,9 @@ window.__ModuleLoader__.load({
         border: '1px solid var(--dsw-alias-border-l2, rgba(127,127,127,.3))',
         background: 'var(--dsw-alias-bg-base, transparent)', color: 'inherit', outline: 'none',
         fontFamily: 'inherit', resize: 'vertical' },
-      btn: { height: '32px', padding: '0 16px', borderRadius: '8px', cursor: 'pointer', fontSize: '13px',
-        border: 'none', background: 'var(--dsw-alias-button-primary-fill, #4a6cf7)', color: '#fff' },
+      btn: { height: '34px', minWidth: '88px', padding: '0 18px', borderRadius: '8px', cursor: 'pointer',
+        fontSize: '13px', fontWeight: 600, color: '#fff', border: '1px solid rgba(0,0,0,.12)',
+        background: '#2f6fed', boxShadow: '0 1px 2px rgba(0,0,0,.18)' },
       btnGhost: { height: '32px', padding: '0 12px', borderRadius: '8px', cursor: 'pointer', fontSize: '13px',
         border: '1px solid var(--dsw-alias-border-l2, rgba(127,127,127,.3))', background: 'transparent', color: 'inherit' },
       grid: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(150px, 1fr))', gap: '10px' },
