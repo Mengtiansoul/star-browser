@@ -630,6 +630,10 @@ const IM_MESSAGES_EXPR = `(() => {
     const nameEl = box ? box.querySelector('[class*="avatarName"]') : null;
     // 分享过来的视频/图文是个卡片，链接只存在于 <a href> 里，文本里压根没有，
     // 所以必须单独抓一遍，否则「分享视频给我」这种消息读出来就是一片空白。
+    const shares = it.querySelectorAll('.MessageItemShareAwemecontainer');
+    const shareAuthor = shares.length
+      ? ((it.querySelector('.MessageItemShareAwemeauthorName') || {}).innerText || '').trim()
+      : '';
     const links = [...it.querySelectorAll('a[href]')]
       .map((a) => a.getAttribute('href') || '')
       .filter((h) => /\\/video\\/\\d+|\\/note\\/\\d+|v\\.douyin\\.com/.test(h))
@@ -641,7 +645,9 @@ const IM_MESSAGES_EXPR = `(() => {
       sender: nameEl ? (nameEl.innerText || '').trim() : null,
       // 自己发的在右侧；私聊不显示昵称，只能靠左右判断
       mine: pr && br ? br.x > pr.x + pr.width / 2 : null,
-      kind: links.length ? 'share' : (text ? 'text' : (imgs ? 'image' : 'other')),
+      shareAuthor,
+      hasShareCard: shares.length > 0,
+      kind: links.length ? 'share' : (shares.length ? 'share-card' : (text ? 'text' : (imgs ? 'image' : 'other'))),
     };
   });
   return JSON.stringify({ count: rows.length, items: rows.slice(-10) });
@@ -1381,8 +1387,10 @@ async function apply(ctx) {
           : m.kind === 'text'
             ? m.text
             : link
-              ? '[视频分享] ' + link
-              : '[非文本]';
+              ? '[视频分享链接] ' + link
+              : m.kind === 'share-card'
+                ? '[视频分享卡片] 作者：' + (m.shareAuthor || '未知') + '（卡片里没有 href，要点开才知道是哪条）'
+                : '[非文本]';
         const name = !sys && m.sender ? `（${m.sender}）` : '';
         lines.push(`${who}${name}: ${body}`);
       }
@@ -1494,6 +1502,19 @@ async function apply(ctx) {
           // 链接优先取卡片上的 <a href>；纯文本里的链接再兜一层。
           // 私聊直接分享视频时是没有 @ 的，所以「有链接就收」，@ 只当标注。
           const raw = (m.links && m.links[0]) || extractVideoLink(txt);
+          // 分享卡片：没有 href，只能靠「点开再看地址栏」。先记下来，open 的时候再点。
+          if (!raw && m.hasShareCard) {
+            const mentioned2 = txt.includes('@' + nick) || txt.includes('@ ' + nick) || txt.includes('提到了我') || txt.includes('提到了你');
+            hits.push({
+              chat: c.name,
+              from: m.sender || (m.mine ? '我' : '对方'),
+              text: '[视频分享卡片] 作者：' + (m.shareAuthor || '未知'),
+              link: null,
+              card: true,
+              mentioned: mentioned2,
+            });
+            continue;
+          }
           if (!raw) continue;
           const link = String(raw).startsWith('http') ? String(raw) : 'https://www.douyin.com' + String(raw);
           const mentioned = txt.includes('@' + nick) || txt.includes('@ ' + nick) || txt.includes('提到了我') || txt.includes('提到了你');
@@ -1516,7 +1537,7 @@ async function apply(ctx) {
       lines.push('', `找到 ${hits.length} 条：`);
       hits.forEach((h, i) => {
         lines.push(`${i + 1}. [${h.chat}]${h.mentioned ? ' [@我]' : ' [分享]'} ${h.from}: ${h.text}`);
-        lines.push(`   链接: ${h.link}`);
+        lines.push(`   链接: ${h.link || '（卡片，需点开才知道）'}`);
       });
 
       if (!args.open) {
@@ -1525,13 +1546,46 @@ async function apply(ctx) {
       }
 
       const first = hits[0];
-      const nav = await rpc('goto', { url: first.link });
-      await sleep(2500);
+      let targetUrl = first.link;
+      let openedVia = 'goto';
+
+      // 分享卡片没有 href，只能真实点开再看地址栏。点完可能当前页跳转，也可能开新标签。
+      if (!targetUrl && first.card) {
+        const marked = await evalOnPage(`(() => {
+          const cards = [...document.querySelectorAll('.MessageItemShareAwemecontainer')];
+          if (!cards.length) return false;
+          // 取最后一个（最新那条分享）
+          cards[cards.length - 1].setAttribute('data-dy-share', '1');
+          return true;
+        })()`, 8000).catch(() => false);
+        if (marked) {
+          await rpc('click', { selector: '[data-dy-share="1"]' }).catch(() => {});
+          await sleep(4000);
+          targetUrl = String((await evalOnPage('location.href', 8000).catch(() => '')) || '');
+          openedVia = 'click-card';
+          // 新标签打开时当前页不会变 —— 把页面列表也报出来，让人知道视频在哪个标签里
+          if (!/\/video\/\d+|\/note\/\d+/.test(targetUrl)) {
+            const pages = await rpc('pages', {}).catch(() => null);
+            lines.push('', '（点开卡片后当前页没跳转，可能开在新标签。当前标签：' +
+              (pages && pages.ok ? JSON.stringify(pages.pages || pages).slice(0, 300) : '取不到') + '）');
+          }
+        }
+      }
+
+      if (!targetUrl) {
+        lines.push('', '⚠️ 找到了分享卡片，但点开后没拿到链接。可以在浏览器里手动点一下它，或者让对方改发链接。');
+        return { text: lines.join('\n') };
+      }
+
+      if (openedVia === 'goto') {
+        await rpc('goto', { url: targetUrl }).catch(() => {});
+        await sleep(2500);
+      }
       const st = await pageState().catch(() => null);
       lines.push(
         '',
-        `▶ 已打开: ${first.link}`,
-        `标题: ${(st && st.title) || (nav && nav.title) || '(读取中)'}`,
+        `▶ 已打开（${openedVia === 'click-card' ? '点卡片' : '直接导航'}）: ${targetUrl}`,
+        `标题: ${(st && st.title) || '(读取中)'}`,
         '',
         '⛔ 看完就停，不要调用 douyin_next。',
         '被动打开的视频不算主动浏览，但一旦下滑就变成主动刷、开始消耗每日 1 小时额度。',
