@@ -34,10 +34,11 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
+import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 
 const name = 'douyin-on-base';
-const inject = ['tools'];
+const inject = ['tools', 'agents'];
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const STATE_FILE = path.join(HERE, 'state.json');
@@ -192,6 +193,64 @@ const HOST_DOWN = '❌ 浏览器基座没在跑。先起它：star-browser --det
 
 /** 最近一次搜索的结果（给 douyin_open 按序号打开用） */
 let lastAwemes = [];
+
+// 最近一次工具调用时抓到的 agent 实例。工具 execute 的第二个参数 exec 里带 exec.agent，
+// agent.id 就是会话 ID，agent.followup(msg) 能把消息喂回给这个会话的模型。
+// DSH 的 Agent 接口（typert.host.js）：readonly id: SessionId; readonly options; followup(message)
+let activeAgent = null;
+let activeAgentAt = 0;
+let pendingWake = false;
+
+function rememberAgent(exec) {
+  if (!exec || !exec.agent) return;
+  if (typeof exec.agent.followup !== 'function') return;
+  activeAgent = exec.agent;
+  activeAgentAt = Date.now();
+}
+
+/** 造一条 plugin 来源的 user message（优先用 DSH 自己的构造器，解析不到就按结构手搓） */
+async function buildUserMessage(text) {
+  const source = { kind: 'plugin:douyin-on-base' };
+  try {
+    const mod = await import('@deepseek-ai/dsh-llm');
+    if (mod && typeof mod.createUserMessage === 'function') {
+      return mod.createUserMessage({ content: [{ type: 'text', text }], source });
+    }
+  } catch { /* 包解析不到，走手搓 */ }
+  return {
+    id: randomUUID(),
+    role: 'user',
+    content: [{ type: 'text', text }],
+    source,
+  };
+}
+
+/**
+ * 页面有新消息 → 把消息喂回当前会话让模型自己判断要不要理。
+ * 只给「有动静」这个事实，不替主人决定该说什么；模型自己会调工具看内容。
+ */
+async function wakeOnNewMessage(ev, logger) {
+  if (!activeAgent) {
+    logger.info('[douyin-on-base] 新消息来了，但还没有活跃会话（工具还没被调用过），这次跳过');
+    return;
+  }
+  if (pendingWake) return;
+  pendingWake = true;
+  try {
+    const text =
+      '抖音那边有新动静（页面 DOM 检测到 ' + (ev.added || 1) + ' 条新消息气泡）。' +
+      '先自己判断要不要理：douyin_check_mentions 能只读地看有没有人 @ 你、有没有分享视频（不受开关限制）；' +
+      '要读私信/群聊内容得先有 chat 开关。' +
+      '如果只是别人闲聊、或者跟你无关，就别出声，也别主动发消息。';
+    const msg = await buildUserMessage(text);
+    activeAgent.followup(msg);
+    logger.info('[douyin-on-base] 已唤醒会话 ' + String(activeAgent.id || '?') + '（新增 ' + (ev.added || 1) + ' 条气泡）');
+  } catch (e) {
+    logger.warn('[douyin-on-base] 唤醒失败: ' + String((e && e.message) || e));
+  } finally {
+    setTimeout(() => { pendingWake = false; }, 5000);
+  }
+}
 
 // ------------------------------------------------------------
 // 页面脚本片段
@@ -857,7 +916,8 @@ async function apply(ctx) {
     },
     timeoutMs: 90000,
     output: OUTPUT_TEXT,
-    execute: (args) => withHost(async () => {
+    execute: (args, exec) => withHost(async () => {
+        rememberAgent(exec);
       if (!args.keyword) throw new Error('需要 keyword');
       const r = await searchAwemes(args.keyword, { limit: args.limit || 20 });
       lastAwemes = r.items;
@@ -885,7 +945,8 @@ async function apply(ctx) {
     },
     timeoutMs: 90000,
     output: OUTPUT_TEXT,
-    execute: (args) => withHost(async () => {
+    execute: (args, exec) => withHost(async () => {
+        rememberAgent(exec);
       let id = args.aweme_id;
       if (!id && args.index) {
         const hit = lastAwemes[args.index - 1];
@@ -915,7 +976,8 @@ async function apply(ctx) {
     },
     timeoutMs: 120000,
     output: OUTPUT_TEXT,
-    execute: (args) => withHost(async () => {
+    execute: (args, exec) => withHost(async () => {
+        rememberAgent(exec);
       const st = loadState();
       if (browseBlocked(st)) return { text: browseBlockedText(st) };
 
@@ -970,7 +1032,8 @@ async function apply(ctx) {
     parameters: { type: 'object', additionalProperties: false },
     timeoutMs: 45000,
     output: OUTPUT_TEXT,
-    execute: () => withHost(async () => {
+    execute: (_a, exec) => withHost(async () => {
+        rememberAgent(exec);
       const st = await pageState();
       const s = loadState();
       const on = (x) => (String(x).includes('is-') ? '已' : '未');
@@ -1003,7 +1066,8 @@ async function apply(ctx) {
     },
     timeoutMs: 60000,
     output: OUTPUT_TEXT,
-    execute: (args) => withHost(async () => {
+    execute: (args, exec) => withHost(async () => {
+        rememberAgent(exec);
       const mode = args.mode === 'viewport' ? 'viewport' : 'video';
       const st = await pageState().catch(() => null);
       const shot = await lookAtVideo({ mode });
@@ -1042,7 +1106,8 @@ async function apply(ctx) {
     },
     timeoutMs: 150000,
     output: OUTPUT_TEXT,
-    execute: (args) => withHost(async () => {
+    execute: (args, exec) => withHost(async () => {
+        rememberAgent(exec);
       const mode = args.mode === 'viewport' ? 'viewport' : 'video';
       const shot = await lookAtVideo({ mode });
       const st = await pageState().catch(() => null);
@@ -1099,7 +1164,8 @@ async function apply(ctx) {
     },
     timeoutMs: 60000,
     output: OUTPUT_TEXT,
-    execute: (args) => withHost(async () => {
+    execute: (args, exec) => withHost(async () => {
+        rememberAgent(exec);
       const st = loadState();
       const want = (args.action || 'like') === 'like';
       const gate = await qualityGate('点赞', st);
@@ -1125,7 +1191,8 @@ async function apply(ctx) {
     },
     timeoutMs: 60000,
     output: OUTPUT_TEXT,
-    execute: (args) => withHost(async () => {
+    execute: (args, exec) => withHost(async () => {
+        rememberAgent(exec);
       const st = loadState();
       const want = (args.action || 'on') !== 'off';
       const gate = await qualityGate('收藏', st);
@@ -1153,7 +1220,8 @@ async function apply(ctx) {
     },
     timeoutMs: 90000,
     output: OUTPUT_TEXT,
-    execute: (args) => withHost(async () => {
+    execute: (args, exec) => withHost(async () => {
+        rememberAgent(exec);
       const st = loadState();
       const gate = await qualityGate('评论', st);
 
@@ -1223,7 +1291,8 @@ async function apply(ctx) {
     },
     timeoutMs: 90000,
     output: OUTPUT_TEXT,
-    execute: (args) => withHost(async () => {
+    execute: (args, exec) => withHost(async () => {
+        rememberAgent(exec);
       const st = loadState();
       const mode = args.mode || 'panel';
 
@@ -1300,7 +1369,8 @@ async function apply(ctx) {
     },
     timeoutMs: 60000,
     output: OUTPUT_TEXT,
-    execute: (args) => withHost(async () => {
+    execute: (args, exec) => withHost(async () => {
+        rememberAgent(exec);
       const log = await rpc('get_network_log', {
         limit: args.limit || 10,
         urlFilter: args.filter,
@@ -1333,7 +1403,8 @@ async function apply(ctx) {
     parameters: { type: 'object', additionalProperties: false },
     timeoutMs: 60000,
     output: OUTPUT_TEXT,
-    execute: () => withHost(async () => {
+    execute: (_a, exec) => withHost(async () => {
+        rememberAgent(exec);
       if (!(await ensureImPanel())) return { text: '❌ 消息面板没打开（抖音可能改了入口，或者需要真实点击）' };
       const raw = await evalOnPage(IM_LIST_EXPR, 10000);
       let list = [];
@@ -1362,7 +1433,8 @@ async function apply(ctx) {
     },
     timeoutMs: 90000,
     output: OUTPUT_TEXT,
-    execute: (args) => withHost(async () => {
+    execute: (args, exec) => withHost(async () => {
+        rememberAgent(exec);
       if (!args.target) throw new Error('需要 target（会话名）');
       try {
         await openChatByName(args.target);
@@ -1416,7 +1488,8 @@ async function apply(ctx) {
     },
     timeoutMs: 120000,
     output: OUTPUT_TEXT,
-    execute: (args) => withHost(async () => {
+    execute: (args, exec) => withHost(async () => {
+        rememberAgent(exec);
       if (!args.target) throw new Error('需要 target（会话名）');
       if (!args.text) throw new Error('需要 text');
       const st = loadState();
@@ -1474,7 +1547,8 @@ async function apply(ctx) {
     },
     timeoutMs: 120000,
     output: OUTPUT_TEXT,
-    execute: (args) => withHost(async () => {
+    execute: (args, exec) => withHost(async () => {
+        rememberAgent(exec);
       const nick = (CFG.identity && CFG.identity.selfNickname) || '繁星';
       if (!(await ensureImPanel())) throw new Error('消息面板没打开');
       const raw = await evalOnPage(IM_LIST_EXPR, 12000);
@@ -1600,7 +1674,8 @@ async function apply(ctx) {
     parameters: { type: 'object', additionalProperties: false },
     timeoutMs: 30000,
     output: OUTPUT_TEXT,
-    execute: () => withHost(async () => {
+    execute: (_a, exec) => withHost(async () => {
+        rememberAgent(exec);
       const s = loadState();
       return {
         text: [
@@ -1621,6 +1696,50 @@ async function apply(ctx) {
     logger.info(`douyin-on-base: ${tools.length} 个工具 → ${HOST} (session ${SESSION_ID})`);
     return () => { for (const d of disposers) { try { d(); } catch {} } };
   }, 'douyin-on-base: tools');
+
+  // ---- 实时通道：订阅管家的 /events，页面一有新消息就叫醒当前会话 ----
+  ctx.effect(() => {
+    let stopped = false;
+    let lastWakeAt = 0;
+    (async () => {
+      while (!stopped) {
+        try {
+          const res = await fetch(HOST + '/events', { headers: { accept: 'text/event-stream' } });
+          if (!res.ok || !res.body) throw new Error('SSE ' + res.status);
+          logger.info('[douyin-on-base] SSE 已连上：' + HOST + '/events');
+          const reader = res.body.getReader();
+          const dec = new TextDecoder();
+          let buf = '';
+          while (!stopped) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            buf += dec.decode(value, { stream: true });
+            let cut;
+            while ((cut = buf.indexOf('\n\n')) >= 0) {
+              const block = buf.slice(0, cut);
+              buf = buf.slice(cut + 2);
+              for (const line of block.split('\n')) {
+                if (!line.startsWith('data:')) continue;
+                let ev = null;
+                try { ev = JSON.parse(line.slice(5).trim()); } catch { continue; }
+                if (!ev || ev.type !== 'new_msg') continue;
+                const now = Date.now();
+                if (now - lastWakeAt < 2500) continue;   // 同一波动静只叫醒一次
+                lastWakeAt = now;
+                wakeOnNewMessage(ev, logger).catch(() => {});
+              }
+            }
+          }
+          logger.warn('[douyin-on-base] SSE 断开了，3 秒后重连');
+        } catch (e) {
+          if (stopped) break;
+          logger.warn('[douyin-on-base] SSE 连接失败: ' + String((e && e.message) || e) + '（3 秒后重试）');
+        }
+        if (!stopped) await sleep(3000);
+      }
+    })().catch(() => {});
+    return () => { stopped = true; };
+  }, 'douyin-on-base: sse-wake');
 }
 
 export { name, apply, inject };
