@@ -24,6 +24,8 @@ window.__ModuleLoader__.load({
     var exports = module.exports;
 
     var API = '/douyin/api';
+    /** 保存开始时间：用来保证「保存中…」至少显示 SAVE_MIN_MS */
+    var savingStartedAt = 0;
 
     /** UTF-8 安全的 base64（btoa 只吃 latin1，直接塞中文会抛错） */
     function b64EncodeUtf8(str) {
@@ -112,6 +114,10 @@ window.__ModuleLoader__.load({
       var savingState = useState(false);
       var setSaving = savingState[1];
       var saving = savingState[0];
+      // 保存成功后的短暂提示态（约 2 秒），让点击有明确的完成感
+      var savedState = useState(false);
+      var justSaved = savedState[0];
+      var setJustSaved = savedState[1];
       // 刷新按钮的转圈状态（用户要的视觉反馈）
       var refreshingState = useState(false);
       var setRefreshing = refreshingState[1];
@@ -165,9 +171,12 @@ window.__ModuleLoader__.load({
         });
       }
 
+      var SAVE_MIN_MS = 900;
+
       function save() {
-        if (!d) return;
-        setSaving(true); setErr(''); setInfo('');
+        if (!d || saving) return;
+        setSaving(true); setJustSaved(false); setErr(''); setInfo('');
+        savingStartedAt = Date.now();
         try {
           doSave();
         } catch (e) {
@@ -212,15 +221,21 @@ window.__ModuleLoader__.load({
         if (d.apiKey && d.apiKey.trim()) patch.vision.apiKey = d.apiKey.trim();
 
         function handleResult(r, via) {
-          setSaving(false);
-          if (r.ok && r.body && r.body.ok) {
-            setInfo('✅ 已保存到 config.json' + (via === 'get' ? '' : '') +
-              '，工具下一次调用就生效，不用重启宿主');
-            hydrate(r.body);
-            refreshState();
-          } else {
-            setErr('保存失败：' + ((r.body && r.body.error) || ('HTTP ' + r.status)));
-          }
+          var wait = Math.max(0, SAVE_MIN_MS - (Date.now() - savingStartedAt));
+          var ok = !!(r.ok && r.body && r.body.ok);
+          var finish = function () {
+            setSaving(false);
+            if (ok) {
+              setJustSaved(true);
+              setInfo('✅ 已保存到 config.json，工具下一次调用就生效（不用重启宿主）');
+              setTimeout(function () { setJustSaved(false); }, 2000);
+              setTimeout(function () { setInfo(''); }, 2500);
+              hydrate(r.body);
+            } else {
+              setErr('保存失败：' + ((r.body && r.body.error) || ('HTTP ' + r.status)));
+            }
+          };
+          if (wait > 0) setTimeout(finish, wait); else finish();
         }
 
         // 主通道直接用 GET：实测本机浏览器里 GET 能到宿主、POST 静默挂住
@@ -371,7 +386,13 @@ window.__ModuleLoader__.load({
 
         /* ---------- 保存 ---------- */
         h('div', { style: C.row },
-          h('button', { style: C.btn, disabled: saving || loading, onClick: save }, saving ? '保存中…' : '保存'),
+          h('button', {
+            style: saving || justSaved
+              ? Object.assign({}, C.btn, { background: saving ? '#8a94a6' : '#2f9e44', cursor: 'default' })
+              : C.btn,
+            disabled: saving || loading,
+            onClick: save,
+          }, saving ? '正在保存…' : (justSaved ? '✓ 已保存' : '保存')),
           h('span', { style: C.hint }, cfg && cfg.files ? '配置文件：' + cfg.files.config : '')
         )
       );
