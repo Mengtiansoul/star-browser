@@ -628,13 +628,20 @@ const IM_MESSAGES_EXPR = `(() => {
     const text = (it.innerText || '').trim().replace(/\\s+/g, ' ');
     const imgs = it.querySelectorAll('img').length;
     const nameEl = box ? box.querySelector('[class*="avatarName"]') : null;
+    // 分享过来的视频/图文是个卡片，链接只存在于 <a href> 里，文本里压根没有，
+    // 所以必须单独抓一遍，否则「分享视频给我」这种消息读出来就是一片空白。
+    const links = [...it.querySelectorAll('a[href]')]
+      .map((a) => a.getAttribute('href') || '')
+      .filter((h) => /\\/video\\/\\d+|\\/note\\/\\d+|v\\.douyin\\.com/.test(h))
+      .map((h) => (h.startsWith('http') ? h : 'https://www.douyin.com' + h));
     return {
       text,
       imgs,
+      links: [...new Set(links)],
       sender: nameEl ? (nameEl.innerText || '').trim() : null,
       // 自己发的在右侧；私聊不显示昵称，只能靠左右判断
       mine: pr && br ? br.x > pr.x + pr.width / 2 : null,
-      kind: text ? 'text' : (imgs ? 'image' : 'other'),
+      kind: links.length ? 'share' : (text ? 'text' : (imgs ? 'image' : 'other')),
     };
   });
   return JSON.stringify({ count: rows.length, items: rows.slice(-10) });
@@ -1368,7 +1375,14 @@ async function apply(ctx) {
       for (const m of data.items) {
         const sys = isSystem(m.text);
         const who = sys ? '系统' : m.mine === true ? '我' : m.mine === false ? '对方' : '?';
-        const body = m.kind === 'image' ? '[图片/表情]' : m.kind === 'text' ? m.text : '[非文本]';
+        const link = (m.links && m.links[0]) || '';
+        const body = m.kind === 'image'
+          ? '[图片/表情]'
+          : m.kind === 'text'
+            ? m.text
+            : link
+              ? '[视频分享] ' + link
+              : '[非文本]';
         const name = !sys && m.sender ? `（${m.sender}）` : '';
         lines.push(`${who}${name}: ${body}`);
       }
@@ -1477,11 +1491,19 @@ async function apply(ctx) {
         scanned.push(`${c.name}（${data.items.length} 条）`);
         for (const m of data.items) {
           const txt = String(m.text || '');
-          if (!txt) continue;
+          // 链接优先取卡片上的 <a href>；纯文本里的链接再兜一层。
+          // 私聊直接分享视频时是没有 @ 的，所以「有链接就收」，@ 只当标注。
+          const raw = (m.links && m.links[0]) || extractVideoLink(txt);
+          if (!raw) continue;
+          const link = String(raw).startsWith('http') ? String(raw) : 'https://www.douyin.com' + String(raw);
           const mentioned = txt.includes('@' + nick) || txt.includes('@ ' + nick) || txt.includes('提到了我') || txt.includes('提到了你');
-          if (!mentioned) continue;
-          const link = extractVideoLink(txt);
-          if (link) hits.push({ chat: c.name, from: m.sender || (m.mine ? '我' : '对方'), text: txt.slice(0, 100), link });
+          hits.push({
+            chat: c.name,
+            from: m.sender || (m.mine ? '我' : '对方'),
+            text: (txt || '[视频分享]').slice(0, 100),
+            link,
+            mentioned,
+          });
         }
       }
 
@@ -1493,7 +1515,7 @@ async function apply(ctx) {
       }
       lines.push('', `找到 ${hits.length} 条：`);
       hits.forEach((h, i) => {
-        lines.push(`${i + 1}. [${h.chat}] ${h.from}: ${h.text}`);
+        lines.push(`${i + 1}. [${h.chat}]${h.mentioned ? ' [@我]' : ' [分享]'} ${h.from}: ${h.text}`);
         lines.push(`   链接: ${h.link}`);
       });
 
