@@ -678,6 +678,20 @@ async function openChatByName(name) {
   await sleep(1800);
   return true;
 }
+/**
+ * 从一段聊天文本里挖视频链接。
+ * 支持：v.douyin.com 短链 / douyin.com/video|note/<id> / 裸的 19 位 aweme_id。
+ */
+function extractVideoLink(text) {
+  const s = String(text || '');
+  const short = s.match(/https?:\/\/v\.douyin\.com\/[A-Za-z0-9_-]+/);
+  if (short) return short[0];
+  const full = s.match(/https?:\/\/(?:www\.)?douyin\.com\/(?:video|note)\/\d+/);
+  if (full) return full[0];
+  const bare = s.match(/\b(\d{19})\b/);
+  if (bare) return 'https://www.douyin.com/video/' + bare[1];
+  return null;
+}
 // ------------------------------------------------------------
 // 分享 / 转发
 // ------------------------------------------------------------
@@ -1390,6 +1404,86 @@ async function apply(ctx) {
       }
       return { text: lines.join('\n') };
     }, 'send_chat', 'chat'),
+  });
+  // ---- 群聊/私信 @ 巡检（被动响应，绝不消耗主动浏览额度）----
+  tools.push({
+    name: 'douyin_check_mentions',
+    description:
+      '检查群聊/私信里有没有「@ 我」的未读消息，命中且带视频链接就打开那条视频。' +
+      '⚠️ 这是**被动响应**：打开后必须停。严禁紧接着调用 douyin_next —— 那是主人的主动浏览额度，' +
+      '每滑一次都在消耗每日 1 小时上限。被动看别人 @ 我的视频不算主动浏览，但一旦开始下滑就变成主动刷了。' +
+      '（本工具只读消息，不受 chat 开关限制。）',
+    parameters: {
+      type: 'object', additionalProperties: false,
+      maxChats: { type: 'number', description: '最多翻几个未读会话(默认 3，上限 5)' },
+      open: { type: 'boolean', description: 'true=命中就打开第一条；默认 false 只报告' },
+    },
+    timeoutMs: 120000,
+    output: OUTPUT_TEXT,
+    execute: (args) => withHost(async () => {
+      const nick = (CFG.identity && CFG.identity.selfNickname) || '繁星';
+      if (!(await ensureImPanel())) throw new Error('消息面板没打开');
+      const raw = await evalOnPage(IM_LIST_EXPR, 12000);
+      let list = [];
+      try { list = JSON.parse(raw); } catch {}
+      const unread = list.filter((c) => (c.unread || 0) > 0);
+      if (!unread.length) return { text: `消息面板里有 ${list.length} 个会话，但都没有未读，没有需要处理的 @。` };
+
+      const limit = Math.min(Math.max(Number(args.maxChats) || 3, 1), 5);
+      const hits = [];
+      const scanned = [];
+      for (const c of unread.slice(0, limit)) {
+        try {
+          await openChatByName(c.name);
+        } catch (e) {
+          scanned.push(`${c.name}（打不开：${(e && e.message) || e}）`);
+          continue;
+        }
+        const msgRaw = await evalOnPage(IM_MESSAGES_EXPR, 15000);
+        let data = { items: [] };
+        try { data = JSON.parse(msgRaw); } catch {}
+        scanned.push(`${c.name}（${data.items.length} 条）`);
+        for (const m of data.items) {
+          const txt = String(m.text || '');
+          if (!txt) continue;
+          const mentioned = txt.includes('@' + nick) || txt.includes('@ ' + nick) || txt.includes('提到了我') || txt.includes('提到了你');
+          if (!mentioned) continue;
+          const link = extractVideoLink(txt);
+          if (link) hits.push({ chat: c.name, from: m.sender || (m.mine ? '我' : '对方'), text: txt.slice(0, 100), link });
+        }
+      }
+
+      const lines = [`扫描了 ${scanned.length} 个未读会话：${scanned.join('、')}`];
+      if (!hits.length) {
+        lines.push(`没有找到「@${nick} 且带视频链接」的消息。`);
+        lines.push('（如果昵称不对，改 config.json 的 identity.selfNickname）');
+        return { text: lines.join('\n') };
+      }
+      lines.push('', `找到 ${hits.length} 条：`);
+      hits.forEach((h, i) => {
+        lines.push(`${i + 1}. [${h.chat}] ${h.from}: ${h.text}`);
+        lines.push(`   链接: ${h.link}`);
+      });
+
+      if (!args.open) {
+        lines.push('', '（open=false，只报告没打开。要打开第一条就传 open=true）');
+        return { text: lines.join('\n') };
+      }
+
+      const first = hits[0];
+      const nav = await rpc('goto', { url: first.link });
+      await sleep(2500);
+      const st = await pageState().catch(() => null);
+      lines.push(
+        '',
+        `▶ 已打开: ${first.link}`,
+        `标题: ${(st && st.title) || (nav && nav.title) || '(读取中)'}`,
+        '',
+        '⛔ 看完就停，不要调用 douyin_next。',
+        '被动打开的视频不算主动浏览，但一旦下滑就变成主动刷、开始消耗每日 1 小时额度。',
+      );
+      return { text: lines.join('\n') };
+    }, 'check_mentions'),
   });
   // ---- 今日用量 ----
   tools.push({

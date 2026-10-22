@@ -50,6 +50,10 @@ export const DEFAULT_CONFIG = {
     replies: 10,
     minDigg: 5000,
   },
+  /** 身份信息：群聊里判断「有没有 @ 我」要靠昵称 */
+  identity: {
+    selfNickname: '繁星',
+  },
   behavior: {
     /** 点赞/收藏/评论前的数值参考线（低于它只警告，不拦） */
     warnOnly: true,
@@ -214,6 +218,11 @@ export function sanitizePatch(input) {
       const n = Number(v.timeoutSec);
       if (!Number.isFinite(n) || n < 10 || n > 300) return { ok: false, error: 'timeoutSec 要在 10-300 之间' };
       out.vision.timeoutSec = Math.round(n);
+    }
+  }
+  if (isObj(input.identity)) {
+    if (typeof input.identity.selfNickname === 'string' && input.identity.selfNickname.trim()) {
+      out.identity = { selfNickname: input.identity.selfNickname.trim().slice(0, 32) };
     }
   }
   if (isObj(input.features)) {
