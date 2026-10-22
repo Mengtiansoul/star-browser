@@ -834,7 +834,8 @@ async function apply(ctx) {
   // ---- 打开 ----
   tools.push({
     name: 'douyin_open',
-    description: '按 douyin_search 的序号或 aweme_id 打开视频详情页。',
+    description: '按 douyin_search 的序号或 aweme_id 打开视频详情页。' +
+      '\n      ⚠️ 防呆：如果是通过群聊 @ 或外部链接被动打开的单条视频，看完必须停，不要接着调 douyin_next —— 那会把被动观看变成主动刷流、开始消耗主人每日 1 小时的浏览额度。被动打开本身不计时（只有 douyin_next 会累加）。',
     parameters: {
       type: 'object', additionalProperties: false,
       index: { type: 'number', description: 'douyin_search 结果里的序号(从 1 开始)' },
@@ -863,7 +864,9 @@ async function apply(ctx) {
   // ---- 下滑（含防沉迷计时）----
   tools.push({
     name: 'douyin_next',
-    description: '往下滑切下一条视频（eval 注入 ArrowDown）。' + WORKFLOW_HINT,
+    description: '往下滑切下一条视频（eval 注入 ArrowDown）。' +
+      '\n      ⚠️ 只有主人主动要求刷流时才用。被动打开的单个视频（群聊 @、外部链接）看完整停，严禁调这个 —— 每次都会消耗每日额度。' +
+      WORKFLOW_HINT,
     parameters: {
       type: 'object', additionalProperties: false,
       times: { type: 'number', description: '滑几次(默认 1，最多 10)' },
