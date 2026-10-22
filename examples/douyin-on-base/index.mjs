@@ -1120,6 +1120,8 @@ async function apply(ctx) {
           saveState(st);
           lines.push('✅ 已发送（输入框已清空）');
         }
+      } else if (args.clear && !args.text) {
+        lines.push('（已清空输入框，没有发送）');
       } else {
         lines.push('（只填了草稿，没发送。要发出去再加 send=true）');
       }
