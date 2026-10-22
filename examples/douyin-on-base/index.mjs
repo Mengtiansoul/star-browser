@@ -1293,11 +1293,16 @@ async function apply(ctx) {
       const raw = await evalOnPage(IM_MESSAGES_EXPR, 12000);
       let data = { count: 0, items: [] };
       try { data = JSON.parse(raw); } catch {}
+      // 抖音会在会话里插系统提示（打招呼引导、互相关注提示等），它们在 DOM 上和普通
+      // 消息长得一样，只能靠文案特征认——认得出就标成[系统]，省得模型当成对方说的话。
+      const SYS_HINTS = ['打个招呼吧', '可以开始聊天了', '你们已互相关注', '撤回了一条消息', '以上是打招呼的内容', '对方正在输入'];
+      const isSystem = (txt) => SYS_HINTS.some((h) => String(txt || '').includes(h));
       const lines = [`会话「${args.target}」当前渲染出 ${data.count} 条消息：`, ''];
       for (const m of data.items) {
-        const who = m.mine === true ? '我' : m.mine === false ? '对方' : '?';
+        const sys = isSystem(m.text);
+        const who = sys ? '系统' : m.mine === true ? '我' : m.mine === false ? '对方' : '?';
         const body = m.kind === 'image' ? '[图片/表情]' : m.kind === 'text' ? m.text : '[非文本]';
-        const name = m.sender ? `（${m.sender}）` : '';
+        const name = !sys && m.sender ? `（${m.sender}）` : '';
         lines.push(`${who}${name}: ${body}`);
       }
       if (!data.count) lines.push('(没读到消息：可能是新会话，或页面还没加载完)');
