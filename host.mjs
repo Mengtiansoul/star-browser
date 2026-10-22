@@ -303,6 +303,92 @@ function attachNet(sess, page) {
   });
 }
 
+// ============================================================
+// DOM 事件通道：页面里挂 MutationObserver → CDP binding → SSE 推给订阅方
+//   只用来回答「现在有新消息了没」，内容永远由订阅方自己抓 DOM。
+//   payload 只带 { added, ts }，绝不传原始 Buffer / HTML，避免序列化开销。
+// ============================================================
+const sseClients = new Set();
+const domCdpByPage = new WeakMap();
+
+function broadcastSse(obj) {
+  const line = 'data: ' + JSON.stringify(obj) + '\n\n';
+  for (const res of sseClients) {
+    try { res.write(line); } catch { sseClients.delete(res); }
+  }
+  log('sse broadcast: ' + JSON.stringify(obj) + ' -> ' + sseClients.size + ' client(s)');
+}
+
+// 注入进页面的脚本：只盯着「新增了消息气泡」这一件事，500ms 防抖。
+const INJECT_DOM_WATCHER = `(() => {
+  const KEY = '__starDomWatchInstalled';
+  if (window[KEY]) return 'already';
+  window[KEY] = true;
+  const send = (obj) => {
+    try {
+      if (typeof window.__starDomEvent === 'function') window.__starDomEvent(JSON.stringify(obj));
+    } catch (e) {}
+  };
+  let timer = 0;
+  let pending = 0;
+  const flush = () => {
+    timer = 0;
+    if (pending > 0) { send({ kind: 'new_msg', added: pending, ts: Date.now() }); pending = 0; }
+  };
+  const looksLikeMsg = (node) => {
+    if (!node || node.nodeType !== 1) return false;
+    try {
+      if (node.matches && node.matches('[data-e2e="msg-item-content"]')) return true;
+      if (node.querySelector && node.querySelector('[data-e2e="msg-item-content"]')) return true;
+    } catch (e) {}
+    return false;
+  };
+  const onMut = (muts) => {
+    let n = 0;
+    for (const m of muts) {
+      if (!m.addedNodes) continue;
+      for (const node of m.addedNodes) if (looksLikeMsg(node)) n++;
+    }
+    if (!n) return;
+    pending += n;
+    if (timer) return;
+    timer = setTimeout(flush, 500);   // 防抖：突发一堆只报一次
+  };
+  const start = () => {
+    try {
+      new MutationObserver(onMut).observe(document.documentElement, { childList: true, subtree: true });
+      return 'observing';
+    } catch (e) { return 'error:' + e.message; }
+  };
+  return document.documentElement ? start() : (document.addEventListener('DOMContentLoaded', start, { once: true }), 'waiting-dom');
+})()`;
+
+/** 给某个 page 挂上 DOM 监听（幂等：CDP 会话复用，脚本重复注入会被页面自己挡掉） */
+async function attachDomWatcher(page) {
+  if (!page || page.isClosed()) return;
+  try {
+    let cdp = domCdpByPage.get(page);
+    if (!cdp) {
+      cdp = await page.context().newCDPSession(page);
+      await cdp.send('Runtime.enable');
+      await cdp.send('Runtime.addBinding', { name: '__starDomEvent' });
+      cdp.on('Runtime.bindingCalled', (ev) => {
+        if (ev.name !== '__starDomEvent') return;
+        let payload = {};
+        try { payload = JSON.parse(ev.payload || '{}'); } catch { payload = {}; }
+        broadcastSse({ type: payload.kind || 'new_msg', added: payload.added || 0, ts: payload.ts || Date.now() });
+      });
+      domCdpByPage.set(page, cdp);
+      page.on('close', () => { domCdpByPage.delete(page); });
+      log('dom watcher: cdp session ready for ' + page.url().slice(0, 60));
+    }
+    const r = await cdp.send('Runtime.evaluate', { expression: INJECT_DOM_WATCHER, returnByValue: true }).catch(() => null);
+    const state = r && r.result ? r.result.value : '(no value)';
+    log('dom watcher inject -> ' + state);
+  } catch (e) {
+    log('dom watcher failed: ' + ((e && e.message) || e));
+  }
+}
 async function getSession(sessionId, createIfNotExist = false) {
   const id = String(sessionId || DEFAULT_SESSION);
   const cur = sessions.get(id);
@@ -310,6 +396,7 @@ async function getSession(sessionId, createIfNotExist = false) {
     cur.lastActive = Date.now();
     attachNet(cur, cur.page);   // 页面可能刚被 newpage/switchpage 换过
     primeCdp(cur.page).catch(() => {});  // 提前建好 CDP，卡死时才有中断的机会
+    attachDomWatcher(cur.page).catch(() => {});
     return cur;
   }
   if (cur) { sessions.delete(id); }           // 页面没了 → 丢掉记录重建
@@ -322,6 +409,7 @@ async function getSession(sessionId, createIfNotExist = false) {
     sessions.set(id, sess);
     attachNet(sess, page);
     primeCdp(page).catch(() => {});
+    attachDomWatcher(page).catch(() => {});
     log('session ' + id + ' -> new page (' + page.url() + ')');
     return sess;
   })();
@@ -707,6 +795,24 @@ const server = http.createServer(async (req, res) => {
       pages: context ? context.pages().filter((p) => !p.isClosed()).length : 0,
     });
   }
+  // SSE 长连接：订阅「页面有新消息」这一件事
+  if (req.method === 'GET' && req.url.startsWith('/events')) {
+    try {
+      res.writeHead(200, {
+        'Content-Type': 'text/event-stream; charset=utf-8',
+        'Cache-Control': 'no-cache, no-transform',
+        'Connection': 'keep-alive',
+        'Access-Control-Allow-Origin': '*',
+        'X-Accel-Buffering': 'no',
+      });
+      res.write(': hello\n\n');
+      sseClients.add(res);
+      log('sse client attached, total ' + sseClients.size);
+      const hb = setInterval(() => { try { res.write(': ping\n\n'); } catch {} }, 20000);
+      req.on('close', () => { clearInterval(hb); sseClients.delete(res); log('sse client gone, left ' + sseClients.size); });
+      return;
+    } catch (e) { return; }
+  }
   if (req.method !== 'POST' || !req.url.startsWith('/rpc')) return send(404, { ok: false, error: 'not found' });
 
   let raw = '';
@@ -837,21 +943,25 @@ const server = http.createServer(async (req, res) => {
           if (!rpc.url) return send(400, { ok: false, error: 'url required' });
           await page.goto(rpc.url, { timeout: rpc.timeout || 30000, waitUntil: rpc.waitUntil || 'domcontentloaded' });
           await sleep(300);
+          attachDomWatcher(page).catch(() => {});
           return send(200, { ok: true, sessionId: sid, ...(await snapshotOf(page, sess)) });
         }
         case 'back': {
           await page.goBack({ timeout: 20000 }).catch(() => {});
           await sleep(300);
+          attachDomWatcher(page).catch(() => {});
           return send(200, { ok: true, sessionId: sid, ...(await snapshotOf(page, sess)) });
         }
         case 'forward': {
           await page.goForward({ timeout: 20000 }).catch(() => {});
           await sleep(300);
+          attachDomWatcher(page).catch(() => {});
           return send(200, { ok: true, sessionId: sid, ...(await snapshotOf(page, sess)) });
         }
         case 'reload': {
           await page.reload({ timeout: 25000 }).catch(() => {});
           await sleep(400);
+          attachDomWatcher(page).catch(() => {});
           return send(200, { ok: true, sessionId: sid, ...(await snapshotOf(page, sess)) });
         }
         case 'snapshot': {
