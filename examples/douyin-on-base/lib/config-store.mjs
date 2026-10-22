@@ -77,6 +77,10 @@ const envStr = (n) => {
 };
 const envNum = (n) => {
   const v = envStr(n);
+  // 关键：环境变量不存在时 envStr 返回 ''，而 Number('') === 0 ——
+  // 之前没拦这一下，导致 fromEnv() 拿 0 把 config.json 里的限额全盖掉
+  // （groupForwards/privateForwards/replies/minDigg 全变 0）。
+  if (v === '') return undefined;
   const x = Number(v);
   return Number.isFinite(x) ? x : undefined;
 };
