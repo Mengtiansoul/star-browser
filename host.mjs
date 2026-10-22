@@ -343,11 +343,23 @@ const INJECT_DOM_WATCHER = `(() => {
     } catch (e) {}
     return false;
   };
+  // 会话行：未读数字、最后一条消息预览、时间戳，任何一个变了都算「有新消息」。
+  // 这一路是必需的 —— 聊天窗只渲染当前打开的那个会话，别人在别的会话发消息，
+  // 消息气泡根本不在 DOM 里，只有会话列表会动。
+  const inConvRow = (node) => {
+    let el = node && node.nodeType === 1 ? node : (node && node.parentElement);
+    if (!el || !el.closest) return false;
+    try { return !!el.closest('[data-e2e="conversation-item"]'); } catch (e) { return false; }
+  };
   const onMut = (muts) => {
     let n = 0;
     for (const m of muts) {
+      if (m.type === 'characterData') { if (inConvRow(m.target)) n++; continue; }
       if (!m.addedNodes) continue;
-      for (const node of m.addedNodes) if (looksLikeMsg(node)) n++;
+      for (const node of m.addedNodes) {
+        if (looksLikeMsg(node)) n++;
+        else if (inConvRow(node)) n++;
+      }
     }
     if (!n) return;
     pending += n;
@@ -356,7 +368,9 @@ const INJECT_DOM_WATCHER = `(() => {
   };
   const start = () => {
     try {
-      new MutationObserver(onMut).observe(document.documentElement, { childList: true, subtree: true });
+      new MutationObserver(onMut).observe(document.documentElement, {
+        childList: true, subtree: true, characterData: true,
+      });
       return 'observing';
     } catch (e) { return 'error:' + e.message; }
   };
