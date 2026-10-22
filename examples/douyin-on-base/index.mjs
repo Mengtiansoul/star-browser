@@ -646,7 +646,21 @@ const IM_EDITOR_TEXT_EXPR = `(() => {
 })()`;
 
 /** 打开消息面板（真实点击；合成事件不显示） */
+/**
+ * 确保当前页面在抖音上。
+ * 实测踩坑：页面可能是 about:blank（上一步导航走空了、或新标签页），
+ * 这时消息入口、评论框全都不存在，工具会白等 8 秒然后报「点不开消息入口」。
+ */
+async function ensureDouyinHome() {
+  const url = String((await evalOnPage('location.href', 8000).catch(() => '')) || '');
+  if (url.includes('douyin.com')) return false;
+  await rpc('goto', { url: 'https://www.douyin.com/' });
+  await sleep(3500);
+  return true;
+}
+
 async function ensureImPanel() {
+  await ensureDouyinHome();
   if (await evalOnPage(IM_PANEL_VISIBLE_EXPR, 8000)) return true;
   const r = await rpc('click', { selector: '[data-e2e="im-entry"]' });
   if (!r.ok) throw new Error('点不开消息入口: ' + (r.error || ''));
