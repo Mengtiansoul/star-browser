@@ -891,9 +891,20 @@ const server = http.createServer(async (req, res) => {
           const tsel = rpc.selector;
           if (i == null && !tsel) return send(400, { ok: false, error: 'i or selector required' });
           if (rpc.text == null) return send(400, { ok: false, error: 'text required' });
-          const loc = tsel
-            ? page.locator(tsel).first()
-            : page.locator('[data-star-i="' + i + '"]').first();
+          // 一个选择器可能匹配到多个元素（抖音评论区里就有两个 Draft.js 编辑器，
+          // 第一个是 0×0 的隐藏备用）—— 必须挑「看得见」的那个，否则点它必然超时。
+          const loc0 = tsel
+            ? page.locator(tsel)
+            : page.locator('[data-star-i="' + i + '"]');
+          let loc = loc0.first();
+          const total = await loc0.count().catch(() => 1);
+          if (total > 1) {
+            for (let k = 0; k < total; k++) {
+              const cand = loc0.nth(k);
+              const box = await cand.boundingBox().catch(() => null);
+              if (box && box.width > 2 && box.height > 2) { loc = cand; break; }
+            }
+          }
           if (!tsel) {
             const cnt = await loc.count().catch(() => 0);
             if (cnt === 0) {

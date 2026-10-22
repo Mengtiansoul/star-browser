@@ -1120,7 +1120,19 @@ async function apply(ctx) {
         await rpc('press', { key: 'Enter' });
         await sleep(1500);
         const after = await evalOnPage(COMMENT.text, 8000);
-        if (after) {
+        // 抖音可能弹「接收短信验证码」拦下这条评论 —— 必须明确告诉模型，别当成普通失败
+        const verifyOpen = await evalOnPage(`(() => {
+          const hits = [...document.querySelectorAll('div')].filter((e) => {
+            const t = e.innerText || '';
+            return (t.includes('接收短信验证码') || t.includes('为确保是本人操作')) && e.getBoundingClientRect().width > 200;
+          });
+          return hits.length > 0;
+        })()`, 8000).catch(() => false);
+        if (verifyOpen) {
+          lines.push('⛔ 触发了抖音风控：页面弹出「接收短信验证码」，这条评论没有发出去。');
+          lines.push('需要在浏览器里手动输入手机验证码才能继续；不验证就先别用评论功能。');
+          st.comments = st.comments; // 不发出去就不计数
+        } else if (after) {
           lines.push('⚠️ 按了回车但输入框还有内容，可能没发出去（风控/需要点发送按钮）');
         } else {
           st.comments += 1;
