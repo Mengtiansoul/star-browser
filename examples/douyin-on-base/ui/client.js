@@ -200,7 +200,7 @@ window.__ModuleLoader__.load({
         function handleResult(r, via) {
           setSaving(false);
           if (r.ok && r.body && r.body.ok) {
-            setInfo('✅ 已保存到 config.json' + (via === 'get' ? '（GET 兜底通道）' : '') +
+            setInfo('✅ 已保存到 config.json' + (via === 'get' ? '' : '') +
               '，工具下一次调用就生效，不用重启宿主');
             hydrate(r.body);
             refreshState();
@@ -209,21 +209,19 @@ window.__ModuleLoader__.load({
           }
         }
 
-        postJson('/config', { config: patch }).then(function (r) {
-          if (r.ok && r.body && r.body.ok) return handleResult(r, 'post');
-          // POST 被拒 → 换 GET 兜底再试一次
-          return saveViaGet(patch).then(function (r2) { handleResult(r2, 'get'); })
-            .catch(function () { handleResult(r, 'post'); });
+        // 主通道直接用 GET：实测本机浏览器里 GET 能到宿主、POST 静默挂住
+        // （大概率是广告拦截/防跟踪扩展或 Service Worker 把未知 POST 拦了）。
+        // 参数很小，GET 完全够用；POST 那条路留作以后别的环境再用。
+        saveViaGet(patch).then(function (r) {
+          handleResult(r, 'get');
         }).catch(function (e) {
-          // POST 根本没发出去（实测有的浏览器/反代环境下会这样）→ 直接走 GET
-          saveViaGet(patch).then(function (r2) {
-            handleResult(r2, 'get');
-            if (!(r2.ok && r2.body && r2.body.ok)) {
-              setErr('保存失败（POST: ' + (e && e.message ? e.message : e) + '；GET 兜底也失败）');
-            }
+          // GET 也挂了 → 最后试一次 POST
+          setInfo('GET 没通，正在试 POST…');
+          postJson('/config', { config: patch }).then(function (r) {
+            handleResult(r, 'post');
           }).catch(function (e2) {
             setSaving(false);
-            setErr('保存失败（POST 和 GET 都没通）：' + (e && e.message ? e.message : e) + ' / ' + (e2 && e2.message ? e2.message : e2));
+            setErr('保存失败（GET 和 POST 都没通）：' + (e && e.message ? e.message : e) + ' / ' + (e2 && e2.message ? e2.message : e2));
           });
         });
       }
