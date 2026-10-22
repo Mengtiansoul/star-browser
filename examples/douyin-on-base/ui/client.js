@@ -103,12 +103,19 @@ window.__ModuleLoader__.load({
     function Panel() {
       var loaded = useState(null);
       var cfg = loaded[0], setCfg = loaded[1];
-      var err = useState(''), setErr = err[1];
-      var info = useState(''), setInfo = info[1];
+      var errState = useState(''), setErr = errState[1];
+      var err = errState[0];
+      var infoState = useState(''), setInfo = infoState[1];
+      var info = infoState[0];
       var st = useState(null);
       var stateData = st[0], setState = st[1];
-      var saving = useState(false);
-      var setSaving = saving[1];
+      var savingState = useState(false);
+      var setSaving = savingState[1];
+      var saving = savingState[0];
+      // 刷新按钮的转圈状态（用户要的视觉反馈）
+      var refreshingState = useState(false);
+      var setRefreshing = refreshingState[1];
+      var refreshing = refreshingState[0];
 
       // 草稿：vision / limits
       var draft = useState(null);
@@ -146,9 +153,16 @@ window.__ModuleLoader__.load({
       }, []);
 
       function refreshState() {
+        if (refreshing) return;
+        setRefreshing(true);
         getJson('/state').then(function (r) {
-          if (r.ok && r.body && r.body.ok) setState(r.body.state);
-        }).catch(function () {});
+          setRefreshing(false);
+          if (r.ok && r.body && r.body.ok) { setState(r.body.state); setInfo('已刷新'); setTimeout(function () { setInfo(''); }, 1500); }
+          else setErr('刷新失败：' + ((r.body && r.body.error) || ('HTTP ' + r.status)));
+        }).catch(function (e) {
+          setRefreshing(false);
+          setErr('刷新失败：' + (e && e.message ? e.message : e));
+        });
       }
 
       function save() {
@@ -337,7 +351,11 @@ window.__ModuleLoader__.load({
         h('div', { style: C.card },
           h('div', { style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between' } },
             h('div', { style: C.title }, '今日状态'),
-            h('button', { style: C.btnGhost, onClick: refreshState }, '刷新')
+            h('button', {
+              style: refreshing ? Object.assign({}, C.btnGhost, { opacity: 0.6, cursor: 'default' }) : C.btnGhost,
+              disabled: refreshing,
+              onClick: refreshState,
+            }, refreshing ? '刷新中…' : '刷新')
           ),
           stateData
             ? h('div', { style: C.grid },
